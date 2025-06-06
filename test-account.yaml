@@ -4,8 +4,8 @@ metadata:
   name: test-dev-account
   namespace: default
 spec:
-  accountName: "FCP Test Development Account"
-  email: "test-dev-account+1747946158@example.com"
+  accountName: "FCP Test Account 2"
+  email: "f9a7ff20-4fe2-4668-882e-4c0d1f2cf66b@example.com"
   iamUserAccessToBilling: "DENY"
   tags:
     Environment: "development"

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  annotations:
+    services.k8s.aws/owner-account-id: "695466865794"
+---
+apiVersion: organizations.aws.fcp.io/v1alpha1
+kind: Account
+metadata:
+  name: test-platform-account
+  namespace: platform
+spec:
+  accountName: "FCP Test Account - Platform"
+  email: "9efb9222-7ef0-4edb-83c9-083489bfcfff@example.com"
+  iamUserAccessToBilling: "DENY"
+  ackServices:
+    - serviceName: ec2
+    - serviceName: eks
+    - serviceName: iam
+    - serviceName: s3

@@ -26,6 +26,9 @@ spec:
     - jsonPath: .spec.email
       name: Email
       type: string
+    - jsonPath: .status.lastReconcileTime
+      name: Last Reconcile
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -57,6 +60,37 @@ spec:
               accountName:
                 description: AccountName specifies the name for the new AWS account
                 type: string
+              ackServices:
+                description: ACKServices specifies which ACK services should have
+                  cross-account access to this account
+                items:
+                  description: ACKService defines configuration for an ACK service
+                    that needs cross-account access
+                  properties:
+                    controllerRoleARN:
+                      description: |-
+                        ControllerRoleARN is the ARN of the ACK controller role that will assume the cross-account role
+                        If not specified, it defaults to arn:aws:iam::{SOURCE_ACCOUNT_ID}:role/ack-{serviceName}-controller
+                      type: string
+                    serviceName:
+                      description: ServiceName is the name of the ACK service (e.g.,
+                        "eks", "s3", "rds")
+                      enum:
+                      - eks
+                      - s3
+                      - rds
+                      - dynamodb
+                      - ec2
+                      - ecr
+                      - iam
+                      - lambda
+                      - sqs
+                      - sns
+                      type: string
+                  required:
+                  - serviceName
+                  type: object
+                type: array
               email:
                 description: Email specifies the email address for the root user of
                   the new account
@@ -151,10 +185,24 @@ spec:
                 description: CreateAccountRequestId is the request ID for account
                   creation
                 type: string
+              crossAccountRoleName:
+                description: CrossAccountRoleName is the name of the cross-account
+                  role created in the account
+                type: string
               failureReason:
                 description: FailureReason provides the reason for failure if state
                   is FAILED
                 type: string
+              lastReconcileTime:
+                description: LastReconcileTime is the last time the account was reconciled
+                  for drift detection
+                format: date-time
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the generation observed by the
+                  controller
+                format: int64
+                type: integer
               state:
                 description: State represents the current state of account creation
                 enum:

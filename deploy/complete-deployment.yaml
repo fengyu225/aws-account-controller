@@ -20,9 +20,9 @@ roleRef:
   kind: ClusterRole
   name: manager-role
 subjects:
-- kind: ServiceAccount
-  name: aws-account-controller
-  namespace: aws-account-system
+  - kind: ServiceAccount
+    name: aws-account-controller
+    namespace: aws-account-system
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -41,33 +41,35 @@ spec:
     spec:
       serviceAccountName: aws-account-controller
       containers:
-      - name: manager
-        image: 164314285563.dkr.ecr.us-west-2.amazonaws.com/aws-account-controller:v1.0.0
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8080
-          name: metrics
-        - containerPort: 8081
-          name: health
-        env:
-        - name: ORG_MGMT_ACCOUNT_ID
-          value: "072422391281"
-        resources:
-          requests:
-            cpu: 100m
-            memory: 128Mi
-          limits:
-            cpu: 500m
-            memory: 512Mi
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: manager
+          image: 164314285563.dkr.ecr.us-west-2.amazonaws.com/aws-account-controller:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: health
+          env:
+            - name: ORG_MGMT_ACCOUNT_ID
+              value: "072422391281"
+            - name: AWS_ACCOUNT_ID
+              value: "164314285563"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
