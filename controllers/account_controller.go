@@ -14,9 +14,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/aws/aws-sdk-go-v2/service/organizations/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,6 +46,9 @@ const (
 
 	// Finalizer
 	accountFinalizer = "organizations.aws.fcp.io/account-finalizer"
+
+	// Annotations
+	ownerAccountIDAnnotation = "services.k8s.aws/owner-account-id"
 )
 
 // AccountReconciler reconciles an Account object
@@ -55,6 +60,7 @@ type AccountReconciler struct {
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update;patch
 // AWS Permissions needed: organizations:CreateAccount,organizations:DescribeCreateAccountStatus,organizations:ListParents,organizations:MoveAccount,organizations:TagResource,organizations:CloseAccount
 
 // Reconcile is part of the main kubernetes reconciliation loop
@@ -154,6 +160,11 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 
 	logger.Info("Handling account deletion", "accountId", account.Status.AccountId)
 
+	// Remove owner-account-id annotation from namespace
+	if err := r.removeNamespaceAnnotation(ctx, account); err != nil {
+		logger.Error(err, "failed to remove namespace annotation")
+	}
+
 	if account.Status.AccountId != "" && account.Status.CrossAccountRoleName != "" {
 		if err := r.cleanupCrossAccountRole(ctx, account); err != nil {
 			logger.Error(err, "failed to cleanup cross-account role")
@@ -175,6 +186,66 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// updateNamespaceAnnotation adds the owner-account-id annotation to the namespace
+func (r *AccountReconciler) updateNamespaceAnnotation(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	namespace := &corev1.Namespace{}
+	namespaceName := k8stypes.NamespacedName{Name: account.Namespace}
+
+	if err := r.Get(ctx, namespaceName, namespace); err != nil {
+		return fmt.Errorf("failed to get namespace %s: %w", account.Namespace, err)
+	}
+
+	if namespace.Annotations == nil {
+		namespace.Annotations = make(map[string]string)
+	}
+
+	namespace.Annotations[ownerAccountIDAnnotation] = account.Status.AccountId
+
+	if err := r.Update(ctx, namespace); err != nil {
+		return fmt.Errorf("failed to update namespace %s with annotation: %w", account.Namespace, err)
+	}
+
+	logger.Info("Successfully updated namespace annotation",
+		"namespace", account.Namespace,
+		"accountId", account.Status.AccountId,
+		"annotation", ownerAccountIDAnnotation)
+
+	return nil
+}
+
+// removeNamespaceAnnotation removes the owner-account-id annotation from the namespace
+func (r *AccountReconciler) removeNamespaceAnnotation(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	namespace := &corev1.Namespace{}
+	namespaceName := k8stypes.NamespacedName{Name: account.Namespace}
+
+	if err := r.Get(ctx, namespaceName, namespace); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get namespace %s: %w", account.Namespace, err)
+	}
+
+	if namespace.Annotations != nil {
+		if _, exists := namespace.Annotations[ownerAccountIDAnnotation]; exists {
+			delete(namespace.Annotations, ownerAccountIDAnnotation)
+
+			if err := r.Update(ctx, namespace); err != nil {
+				return fmt.Errorf("failed to remove annotation from namespace %s: %w", account.Namespace, err)
+			}
+
+			logger.Info("Successfully removed namespace annotation",
+				"namespace", account.Namespace,
+				"annotation", ownerAccountIDAnnotation)
+		}
+	}
+
+	return nil
 }
 
 // cleanupCrossAccountRole removes the cross-account IAM role from the target account
@@ -464,6 +535,11 @@ func (r *AccountReconciler) handlePendingAccount(ctx context.Context, account *o
 	case "SUCCEEDED":
 		account.Status.AccountId = *result.CreateAccountStatus.AccountId
 		r.updateCondition(account, "Ready", metav1.ConditionTrue, "AccountCreated", "Account successfully created")
+
+		// Add owner-account-id annotation to namespace
+		if err := r.updateNamespaceAnnotation(ctx, account); err != nil {
+			logger.Error(err, "failed to update namespace annotation", "accountId", account.Status.AccountId)
+		}
 
 		// Move account to specified organizational unit
 		ouId := r.getOrganizationalUnitId(account)

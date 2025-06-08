@@ -69,7 +69,7 @@ docker-build:
 push: docker-push
 
 ## docker-push: Tag and push Docker image to ECR (requires build)
-docker-push: docker-build create-ecr ecr-login
+docker-push: docker-build ecr-login
 	@echo "Tagging image for ECR..."
 	docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(FULL_IMAGE_NAME)
 	@echo "Pushing image to ECR..."
