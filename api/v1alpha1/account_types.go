@@ -17,6 +17,21 @@ type ACKService struct {
 	ControllerRoleARN string `json:"controllerRoleARN,omitempty"`
 }
 
+// ACKServiceIAMRole defines a cross-account IAM role with specific ACK services
+type ACKServiceIAMRole struct {
+	// RoleName is the name of the IAM role to create in the target account
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9-_]*$`
+	RoleName string `json:"roleName"`
+
+	// Services is the list of ACK services that should have access through this role
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	Services []ACKService `json:"services"`
+}
+
 // AccountSpec defines the desired state of Account
 type AccountSpec struct {
 	// AccountName specifies the name for the new AWS account
@@ -42,9 +57,29 @@ type AccountSpec struct {
 	// +optional
 	IamUserAccessToBilling string `json:"iamUserAccessToBilling,omitempty"`
 
-	// ACKServices specifies which ACK services should have cross-account access to this account
+	// ACKServicesIAMRoles specifies the IAM roles to create with their associated ACK services
 	// +optional
-	ACKServices []ACKService `json:"ackServices,omitempty"`
+	ACKServicesIAMRoles []ACKServiceIAMRole `json:"ackServicesIAMRoles,omitempty"`
+}
+
+// CrossAccountRoleStatus represents the status of a cross-account role
+type CrossAccountRoleStatus struct {
+	// RoleName is the name of the cross-account role
+	RoleName string `json:"roleName"`
+
+	// Services is the list of services configured for this role
+	Services []string `json:"services"`
+
+	// State represents the state of the role
+	// +kubebuilder:validation:Enum=CREATING;READY;FAILED;UPDATING
+	State string `json:"state"`
+
+	// LastUpdated is the last time this role was updated
+	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
+
+	// FailureReason provides the reason for failure if state is FAILED
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
 }
 
 // AccountStatus defines the observed state of Account
@@ -66,9 +101,9 @@ type AccountStatus struct {
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
 
-	// CrossAccountRoleName is the name of the cross-account role created in the account
+	// CrossAccountRoles contains the status of all cross-account roles
 	// +optional
-	CrossAccountRoleName string `json:"crossAccountRoleName,omitempty"`
+	CrossAccountRoles []CrossAccountRoleStatus `json:"crossAccountRoles,omitempty"`
 
 	// LastReconcileTime is the last time the account was reconciled for drift detection
 	// +optional
@@ -89,6 +124,7 @@ type AccountStatus struct {
 // +kubebuilder:printcolumn:name="Account ID",type=string,JSONPath=`.status.accountId`
 // +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
 // +kubebuilder:printcolumn:name="Email",type=string,JSONPath=`.spec.email`
+// +kubebuilder:printcolumn:name="Roles",type=string,JSONPath=`.status.crossAccountRoles[*].roleName`
 // +kubebuilder:printcolumn:name="Last Reconcile",type=date,JSONPath=`.status.lastReconcileTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

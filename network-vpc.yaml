@@ -1,0 +1,53 @@
+apiVersion: ec2.services.k8s.aws/v1alpha1
+kind: VPC
+metadata:
+  name: test-network-vpc
+  namespace: network
+spec:
+  cidrBlocks:
+    - "10.0.0.0/16"
+  enableDNSHostnames: true
+  enableDNSSupport: true
+  tags:
+    - key: Name
+      value: test-network-vpc
+    - key: Environment
+      value: network
+    - key: ManagedBy
+      value: ACK
+---
+apiVersion: ec2.services.k8s.aws/v1alpha1
+kind: Subnet
+metadata:
+  name: test-network-private-subnet-1
+  namespace: network
+spec:
+  availabilityZone: us-west-2a
+  cidrBlock: "10.0.10.0/24"
+  mapPublicIPOnLaunch: false
+  vpcRef:
+    from:
+      name: test-network-vpc
+  tags:
+    - key: Name
+      value: test-network-private-subnet-1
+    - key: Type
+      value: private
+---
+apiVersion: ec2.services.k8s.aws/v1alpha1
+kind: Subnet
+metadata:
+  name: test-network-private-subnet-2
+  namespace: network
+spec:
+  availabilityZone: us-west-2b
+  cidrBlock: "10.0.11.0/24"
+  mapPublicIPOnLaunch: false
+  vpcRef:
+    from:
+      name: test-network-vpc
+  tags:
+    - key: Name
+      value: test-network-private-subnet-2
+    - key: Type
+      value: private

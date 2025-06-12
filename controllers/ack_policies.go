@@ -149,7 +149,8 @@ var ACKPolicies = map[string]ACKServicePolicies{
 						"iam:GetOpenIDConnectProvider",
 						"iam:TagOpenIDConnectProvider",
 						"iam:CreateOpenIDConnectProvider",
-						"iam:UpdateAssumeRolePolicy"
+						"iam:UpdateAssumeRolePolicy",
+						"iam:CreateServiceLinkedRole"
 					],
 					"Resource": "*"
 				}

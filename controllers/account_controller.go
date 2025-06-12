@@ -33,7 +33,6 @@ const (
 	// AWS Role Names
 	orgAccountCreatorRole = "OrganizationAccountCreatorRole"
 	orgAccountAccessRole  = "OrganizationAccountAccessRole"
-	ackCrossAccountRole   = "ACKCrossAccountRole"
 
 	// External IDs and Session Names
 	orgAccountCreatorExternalID = "fcp-infra-account-creator"
@@ -165,9 +164,9 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 		logger.Error(err, "failed to remove namespace annotation")
 	}
 
-	if account.Status.AccountId != "" && account.Status.CrossAccountRoleName != "" {
-		if err := r.cleanupCrossAccountRole(ctx, account); err != nil {
-			logger.Error(err, "failed to cleanup cross-account role")
+	if account.Status.AccountId != "" {
+		if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
+			logger.Error(err, "failed to cleanup cross-account roles")
 		}
 	}
 
@@ -248,8 +247,8 @@ func (r *AccountReconciler) removeNamespaceAnnotation(ctx context.Context, accou
 	return nil
 }
 
-// cleanupCrossAccountRole removes the cross-account IAM role from the target account
-func (r *AccountReconciler) cleanupCrossAccountRole(ctx context.Context, account *organizationsv1alpha1.Account) error {
+// cleanupAllCrossAccountRoles removes all cross-account IAM roles from the target account
+func (r *AccountReconciler) cleanupAllCrossAccountRoles(ctx context.Context, account *organizationsv1alpha1.Account) error {
 	logger := log.FromContext(ctx)
 
 	iamClient, err := r.getIAMClientForAccount(ctx, account.Status.AccountId)
@@ -258,7 +257,25 @@ func (r *AccountReconciler) cleanupCrossAccountRole(ctx context.Context, account
 		return err
 	}
 
-	roleName := account.Status.CrossAccountRoleName
+	for _, roleStatus := range account.Status.CrossAccountRoles {
+		if err := r.cleanupSingleRole(ctx, iamClient, roleStatus.RoleName); err != nil {
+			logger.Error(err, "failed to cleanup role", "roleName", roleStatus.RoleName)
+		}
+	}
+
+	return nil
+}
+
+// cleanupSingleRole removes a single IAM role and its policies
+func (r *AccountReconciler) cleanupSingleRole(ctx context.Context, iamClient *iam.Client, roleName string) error {
+	logger := log.FromContext(ctx)
+
+	_, err := iamClient.GetRole(ctx, &iam.GetRoleInput{
+		RoleName: aws.String(roleName),
+	})
+	if err != nil {
+		return nil
+	}
 
 	listAttachedInput := &iam.ListAttachedRolePoliciesInput{
 		RoleName: aws.String(roleName),
@@ -339,26 +356,6 @@ func (r *AccountReconciler) deleteAWSAccount(ctx context.Context, accountId stri
 	return nil
 }
 
-// performPeriodicReconciliation handles drift detection reconciliation
-func (r *AccountReconciler) performPeriodicReconciliation(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	result, err := r.reconcileAccountResources(ctx, account)
-	if err != nil {
-		logger.Error(err, "periodic reconciliation failed")
-		return result, err
-	}
-
-	account.Status.LastReconcileTime = metav1.Now()
-	if err := r.Status().Update(ctx, account); err != nil {
-		logger.Error(err, "failed to update last reconcile time")
-		return ctrl.Result{}, err
-	}
-
-	logger.Info("Periodic reconciliation completed successfully", "accountId", account.Status.AccountId)
-	return ctrl.Result{RequeueAfter: fullReconcileInterval}, nil
-}
-
 // handleSucceededAccount processes accounts that have been successfully created
 func (r *AccountReconciler) handleSucceededAccount(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -388,19 +385,265 @@ func (r *AccountReconciler) handleSucceededAccount(ctx context.Context, account 
 func (r *AccountReconciler) reconcileAccountResources(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if len(account.Spec.ACKServices) > 0 {
-		logger.Info("Reconciling ACK IAM role", "accountId", account.Status.AccountId)
-		return r.handleCrossAccountRoleCreation(ctx, account)
+	if len(account.Spec.ACKServicesIAMRoles) > 0 {
+		logger.Info("Reconciling ACK IAM roles", "accountId", account.Status.AccountId, "roleCount", len(account.Spec.ACKServicesIAMRoles))
+		return r.handleMultipleCrossAccountRoles(ctx, account)
 	}
 
-	// Clean up IAM role if no ACK services specified
-	if r.hasCondition(account, "CrossAccountRoleCreated") {
-		logger.Info("No ACK services specified, role cleanup may be needed", "accountId", account.Status.AccountId)
-		// TODO: implement role cleanup
-		r.updateCondition(account, "CrossAccountRoleCreated", metav1.ConditionFalse, "NoServicesSpecified", "No ACK services specified")
+	logger.Info("No ACK service roles specified", "accountId", account.Status.AccountId)
+
+	if len(account.Status.CrossAccountRoles) > 0 {
+		logger.Info("Cleaning up existing roles as none are specified in spec")
+		if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
+			logger.Error(err, "failed to cleanup existing roles")
+		}
+		account.Status.CrossAccountRoles = []organizationsv1alpha1.CrossAccountRoleStatus{}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// handleMultipleCrossAccountRoles creates/updates multiple IAM roles based on ACKServicesIAMRoles
+func (r *AccountReconciler) handleMultipleCrossAccountRoles(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	iamClient, err := r.getIAMClientForAccount(ctx, account.Status.AccountId)
+	if err != nil {
+		logger.Error(err, "failed to get IAM client for account", "accountId", account.Status.AccountId)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	sourceAccountID := getEnvOrDefault("AWS_ACCOUNT_ID", defaultSourceAccountID)
+
+	managedRoles := make(map[string]bool)
+	newRoleStatuses := []organizationsv1alpha1.CrossAccountRoleStatus{}
+
+	for _, roleSpec := range account.Spec.ACKServicesIAMRoles {
+		managedRoles[roleSpec.RoleName] = true
+
+		roleStatus := organizationsv1alpha1.CrossAccountRoleStatus{
+			RoleName: roleSpec.RoleName,
+			State:    "CREATING",
+			Services: []string{},
+		}
+
+		for _, svc := range roleSpec.Services {
+			roleStatus.Services = append(roleStatus.Services, svc.ServiceName)
+		}
+
+		if err := r.createOrUpdateCrossAccountRoleForServices(ctx, iamClient, account, sourceAccountID, roleSpec.RoleName, roleSpec.Services); err != nil {
+			logger.Error(err, "failed to create/update role", "roleName", roleSpec.RoleName)
+			roleStatus.State = "FAILED"
+			roleStatus.FailureReason = err.Error()
+		} else {
+			if err := r.reconcileServicePoliciesForRole(ctx, iamClient, roleSpec.RoleName, roleSpec.Services); err != nil {
+				logger.Error(err, "failed to reconcile policies", "roleName", roleSpec.RoleName)
+				roleStatus.State = "FAILED"
+				roleStatus.FailureReason = err.Error()
+			} else {
+				roleStatus.State = "READY"
+			}
+		}
+
+		roleStatus.LastUpdated = metav1.Now()
+		newRoleStatuses = append(newRoleStatuses, roleStatus)
+	}
+
+	for _, existingRole := range account.Status.CrossAccountRoles {
+		if !managedRoles[existingRole.RoleName] {
+			logger.Info("Removing role no longer in spec", "roleName", existingRole.RoleName)
+			if err := r.cleanupSingleRole(ctx, iamClient, existingRole.RoleName); err != nil {
+				logger.Error(err, "failed to cleanup removed role", "roleName", existingRole.RoleName)
+			}
+		}
+	}
+
+	account.Status.CrossAccountRoles = newRoleStatuses
+	r.updateCondition(account, "CrossAccountRolesCreated", metav1.ConditionTrue, "RolesReconciled", fmt.Sprintf("Successfully reconciled %d cross-account roles", len(newRoleStatuses)))
+
+	return ctrl.Result{}, nil
+}
+
+// createOrUpdateCrossAccountRoleForServices creates or updates an IAM role for specific services
+func (r *AccountReconciler) createOrUpdateCrossAccountRoleForServices(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, sourceAccountID, roleName string, services []organizationsv1alpha1.ACKService) error {
+	logger := log.FromContext(ctx)
+
+	trustPolicy := r.buildTrustPolicyForServices(sourceAccountID, services)
+	trustPolicyJSON, err := json.Marshal(trustPolicy)
+	if err != nil {
+		return fmt.Errorf("failed to marshal trust policy: %w", err)
+	}
+
+	getRoleInput := &iam.GetRoleInput{
+		RoleName: aws.String(roleName),
+	}
+
+	_, err = iamClient.GetRole(ctx, getRoleInput)
+	if err != nil {
+		logger.Info("Creating IAM role", "roleName", roleName)
+		createRoleInput := &iam.CreateRoleInput{
+			RoleName:                 aws.String(roleName),
+			AssumeRolePolicyDocument: aws.String(string(trustPolicyJSON)),
+			Description:              aws.String("ACK cross-account role for service controllers"),
+		}
+
+		_, err = iamClient.CreateRole(ctx, createRoleInput)
+		if err != nil {
+			return fmt.Errorf("failed to create role: %w", err)
+		}
+	} else {
+		logger.Info("Updating role trust policy", "roleName", roleName)
+		updateAssumeRolePolicyInput := &iam.UpdateAssumeRolePolicyInput{
+			RoleName:       aws.String(roleName),
+			PolicyDocument: aws.String(string(trustPolicyJSON)),
+		}
+
+		_, err = iamClient.UpdateAssumeRolePolicy(ctx, updateAssumeRolePolicyInput)
+		if err != nil {
+			return fmt.Errorf("failed to update assume role policy: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// buildTrustPolicyForServices builds a trust policy for specific ACK services
+// The trust policy ensures that only the specified ACK controller roles can assume this cross-account role
+// For example, if services include "eks" and "s3", only ack-eks-controller and ack-s3-controller
+// from the source account will be able to assume this role
+func (r *AccountReconciler) buildTrustPolicyForServices(sourceAccountID string, services []organizationsv1alpha1.ACKService) map[string]interface{} {
+	allowedRoleArns := []string{}
+
+	for _, service := range services {
+		var roleArn string
+		if service.ControllerRoleARN != "" {
+			roleArn = service.ControllerRoleARN
+		} else {
+			// Default pattern: arn:aws:iam::{SOURCE_ACCOUNT_ID}:role/ack-{serviceName}-controller
+			roleArn = fmt.Sprintf("arn:aws:iam::%s:role/ack-%s-controller", sourceAccountID, service.ServiceName)
+		}
+		allowedRoleArns = append(allowedRoleArns, roleArn)
+	}
+
+	return map[string]interface{}{
+		"Version": "2012-10-17",
+		"Statement": []map[string]interface{}{
+			{
+				"Effect": "Allow",
+				"Principal": map[string]interface{}{
+					"AWS": fmt.Sprintf("arn:aws:iam::%s:root", sourceAccountID),
+				},
+				"Action": "sts:AssumeRole",
+				"Condition": map[string]interface{}{
+					"ArnEquals": map[string]interface{}{
+						"aws:PrincipalArn": allowedRoleArns,
+					},
+				},
+			},
+		},
+	}
+}
+
+// reconcileServicePoliciesForRole applies policies for specific services to a role
+func (r *AccountReconciler) reconcileServicePoliciesForRole(ctx context.Context, iamClient *iam.Client, roleName string, services []organizationsv1alpha1.ACKService) error {
+	logger := log.FromContext(ctx)
+
+	listAttachedInput := &iam.ListAttachedRolePoliciesInput{
+		RoleName: aws.String(roleName),
+	}
+
+	attachedPolicies, err := iamClient.ListAttachedRolePolicies(ctx, listAttachedInput)
+	if err != nil {
+		return fmt.Errorf("failed to list attached policies: %w", err)
+	}
+
+	listInlineInput := &iam.ListRolePoliciesInput{
+		RoleName: aws.String(roleName),
+	}
+
+	inlinePolicies, err := iamClient.ListRolePolicies(ctx, listInlineInput)
+	if err != nil {
+		return fmt.Errorf("failed to list inline policies: %w", err)
+	}
+
+	// Build desired policies
+	desiredManagedPolicies := make(map[string]bool)
+	desiredInlinePolicies := make(map[string]string)
+
+	for _, service := range services {
+		policies, ok := ACKPolicies[service.ServiceName]
+		if !ok {
+			logger.Info("No predefined policies for service, skipping", "service", service.ServiceName)
+			continue
+		}
+
+		for _, arn := range policies.ManagedPolicyARNs {
+			desiredManagedPolicies[arn] = true
+		}
+
+		if policies.InlinePolicy != "" {
+			desiredInlinePolicies[fmt.Sprintf("ack-%s-policy", service.ServiceName)] = policies.InlinePolicy
+		}
+	}
+
+	// Remove unwanted managed policies
+	for _, policy := range attachedPolicies.AttachedPolicies {
+		if !desiredManagedPolicies[*policy.PolicyArn] {
+			logger.Info("Detaching managed policy", "policyARN", *policy.PolicyArn, "roleName", roleName)
+			detachInput := &iam.DetachRolePolicyInput{
+				RoleName:  aws.String(roleName),
+				PolicyArn: policy.PolicyArn,
+			}
+			_, err := iamClient.DetachRolePolicy(ctx, detachInput)
+			if err != nil {
+				return fmt.Errorf("failed to detach policy %s: %w", *policy.PolicyArn, err)
+			}
+		}
+	}
+
+	// Remove unwanted inline policies
+	for _, policyName := range inlinePolicies.PolicyNames {
+		if _, exists := desiredInlinePolicies[policyName]; !exists {
+			logger.Info("Deleting inline policy", "policyName", policyName, "roleName", roleName)
+			deleteInput := &iam.DeleteRolePolicyInput{
+				RoleName:   aws.String(roleName),
+				PolicyName: aws.String(policyName),
+			}
+			_, err := iamClient.DeleteRolePolicy(ctx, deleteInput)
+			if err != nil {
+				return fmt.Errorf("failed to delete inline policy %s: %w", policyName, err)
+			}
+		}
+	}
+
+	// Add desired managed policies
+	for policyARN := range desiredManagedPolicies {
+		logger.Info("Attaching managed policy", "policyARN", policyARN, "roleName", roleName)
+		attachInput := &iam.AttachRolePolicyInput{
+			RoleName:  aws.String(roleName),
+			PolicyArn: aws.String(policyARN),
+		}
+		_, err := iamClient.AttachRolePolicy(ctx, attachInput)
+		if err != nil {
+			return fmt.Errorf("failed to attach policy %s: %w", policyARN, err)
+		}
+	}
+
+	// Add desired inline policies
+	for policyName, policyDocument := range desiredInlinePolicies {
+		logger.Info("Putting inline policy", "policyName", policyName, "roleName", roleName)
+		putInput := &iam.PutRolePolicyInput{
+			RoleName:       aws.String(roleName),
+			PolicyName:     aws.String(policyName),
+			PolicyDocument: aws.String(policyDocument),
+		}
+		_, err := iamClient.PutRolePolicy(ctx, putInput)
+		if err != nil {
+			return fmt.Errorf("failed to put inline policy %s: %w", policyName, err)
+		}
+	}
+
+	return nil
 }
 
 // getOrganizationManagementConfig returns AWS config that assumes the OrganizationAccountCreatorRole
@@ -610,211 +853,6 @@ func (r *AccountReconciler) moveAccountToOU(ctx context.Context, orgClient *orga
 		"accountId", accountId,
 		"sourceParentId", sourceParentId,
 		"destinationOuId", ouId)
-
-	return nil
-}
-
-func (r *AccountReconciler) handleCrossAccountRoleCreation(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	if len(account.Spec.ACKServices) == 0 {
-		logger.Info("No ACK services specified, skipping cross-account role creation")
-		return ctrl.Result{}, nil
-	}
-
-	iamClient, err := r.getIAMClientForAccount(ctx, account.Status.AccountId)
-	if err != nil {
-		logger.Error(err, "failed to get IAM client for account", "accountId", account.Status.AccountId)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
-	}
-
-	sourceAccountID := getEnvOrDefault("AWS_ACCOUNT_ID", defaultSourceAccountID)
-
-	if err := r.createOrUpdateCrossAccountRole(ctx, iamClient, account, sourceAccountID, ackCrossAccountRole); err != nil {
-		logger.Error(err, "failed to create/update role")
-		return ctrl.Result{RequeueAfter: time.Minute}, err
-	}
-
-	if err := r.reconcileServicePolicies(ctx, iamClient, account, ackCrossAccountRole); err != nil {
-		logger.Error(err, "failed to reconcile service policies")
-		return ctrl.Result{RequeueAfter: time.Minute}, err
-	}
-
-	account.Status.CrossAccountRoleName = ackCrossAccountRole
-	r.updateCondition(account, "CrossAccountRoleCreated", metav1.ConditionTrue, "RoleReconciled", "Cross-account role successfully reconciled")
-
-	return ctrl.Result{}, nil
-}
-
-// createOrUpdateCrossAccountRole creates or updates the IAM role without comparing policies
-func (r *AccountReconciler) createOrUpdateCrossAccountRole(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, sourceAccountID, roleName string) error {
-	logger := log.FromContext(ctx)
-
-	trustPolicy := r.buildTrustPolicy(account, sourceAccountID)
-	trustPolicyJSON, err := json.Marshal(trustPolicy)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trust policy: %w", err)
-	}
-
-	getRoleInput := &iam.GetRoleInput{
-		RoleName: aws.String(roleName),
-	}
-
-	_, err = iamClient.GetRole(ctx, getRoleInput)
-	if err != nil {
-		logger.Info("Creating IAM role", "roleName", roleName)
-		createRoleInput := &iam.CreateRoleInput{
-			RoleName:                 aws.String(roleName),
-			AssumeRolePolicyDocument: aws.String(string(trustPolicyJSON)),
-			Description:              aws.String("ACK cross-account role for service controllers"),
-		}
-
-		_, err = iamClient.CreateRole(ctx, createRoleInput)
-		if err != nil {
-			r.updateCondition(account, "CrossAccountRoleCreated", metav1.ConditionFalse, "CreateRoleFailed", err.Error())
-			return fmt.Errorf("failed to create role: %w", err)
-		}
-	} else {
-		logger.Info("Updating role trust policy", "roleName", roleName)
-		updateAssumeRolePolicyInput := &iam.UpdateAssumeRolePolicyInput{
-			RoleName:       aws.String(roleName),
-			PolicyDocument: aws.String(string(trustPolicyJSON)),
-		}
-
-		_, err = iamClient.UpdateAssumeRolePolicy(ctx, updateAssumeRolePolicyInput)
-		if err != nil {
-			return fmt.Errorf("failed to update assume role policy: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (r *AccountReconciler) buildTrustPolicy(account *organizationsv1alpha1.Account, sourceAccountID string) map[string]interface{} {
-	allowedRoleArns := []string{}
-
-	for _, service := range account.Spec.ACKServices {
-		var roleArn string
-		if service.ControllerRoleARN != "" {
-			roleArn = service.ControllerRoleARN
-		} else {
-			roleArn = fmt.Sprintf("arn:aws:iam::%s:role/ack-%s-controller", sourceAccountID, service.ServiceName)
-		}
-		allowedRoleArns = append(allowedRoleArns, roleArn)
-	}
-
-	return map[string]interface{}{
-		"Version": "2012-10-17",
-		"Statement": []map[string]interface{}{
-			{
-				"Effect": "Allow",
-				"Principal": map[string]interface{}{
-					"AWS": fmt.Sprintf("arn:aws:iam::%s:root", sourceAccountID),
-				},
-				"Action": "sts:AssumeRole",
-				"Condition": map[string]interface{}{
-					"ArnEquals": map[string]interface{}{
-						"aws:PrincipalArn": allowedRoleArns,
-					},
-				},
-			},
-		},
-	}
-}
-
-// reconcileServicePolicies applies desired policies without comparison
-func (r *AccountReconciler) reconcileServicePolicies(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, roleName string) error {
-	logger := log.FromContext(ctx)
-
-	listAttachedInput := &iam.ListAttachedRolePoliciesInput{
-		RoleName: aws.String(roleName),
-	}
-
-	attachedPolicies, err := iamClient.ListAttachedRolePolicies(ctx, listAttachedInput)
-	if err != nil {
-		return fmt.Errorf("failed to list attached policies: %w", err)
-	}
-
-	listInlineInput := &iam.ListRolePoliciesInput{
-		RoleName: aws.String(roleName),
-	}
-
-	inlinePolicies, err := iamClient.ListRolePolicies(ctx, listInlineInput)
-	if err != nil {
-		return fmt.Errorf("failed to list inline policies: %w", err)
-	}
-
-	desiredManagedPolicies := make(map[string]bool)
-	desiredInlinePolicies := make(map[string]string)
-
-	for _, service := range account.Spec.ACKServices {
-		policies, ok := ACKPolicies[service.ServiceName]
-		if !ok {
-			logger.Info("No predefined policies for service, skipping", "service", service.ServiceName)
-			continue
-		}
-
-		for _, arn := range policies.ManagedPolicyARNs {
-			desiredManagedPolicies[arn] = true
-		}
-
-		if policies.InlinePolicy != "" {
-			desiredInlinePolicies[fmt.Sprintf("ack-%s-policy", service.ServiceName)] = policies.InlinePolicy
-		}
-	}
-
-	for _, policy := range attachedPolicies.AttachedPolicies {
-		if !desiredManagedPolicies[*policy.PolicyArn] {
-			logger.Info("Detaching managed policy", "policyARN", *policy.PolicyArn, "roleName", roleName)
-			detachInput := &iam.DetachRolePolicyInput{
-				RoleName:  aws.String(roleName),
-				PolicyArn: policy.PolicyArn,
-			}
-			_, err := iamClient.DetachRolePolicy(ctx, detachInput)
-			if err != nil {
-				return fmt.Errorf("failed to detach policy %s: %w", *policy.PolicyArn, err)
-			}
-		}
-	}
-
-	for _, policyName := range inlinePolicies.PolicyNames {
-		if _, exists := desiredInlinePolicies[policyName]; !exists {
-			logger.Info("Deleting inline policy", "policyName", policyName, "roleName", roleName)
-			deleteInput := &iam.DeleteRolePolicyInput{
-				RoleName:   aws.String(roleName),
-				PolicyName: aws.String(policyName),
-			}
-			_, err := iamClient.DeleteRolePolicy(ctx, deleteInput)
-			if err != nil {
-				return fmt.Errorf("failed to delete inline policy %s: %w", policyName, err)
-			}
-		}
-	}
-
-	for policyARN := range desiredManagedPolicies {
-		logger.Info("Attaching managed policy", "policyARN", policyARN, "roleName", roleName)
-		attachInput := &iam.AttachRolePolicyInput{
-			RoleName:  aws.String(roleName),
-			PolicyArn: aws.String(policyARN),
-		}
-		_, err := iamClient.AttachRolePolicy(ctx, attachInput)
-		if err != nil {
-			return fmt.Errorf("failed to attach policy %s: %w", policyARN, err)
-		}
-	}
-
-	for policyName, policyDocument := range desiredInlinePolicies {
-		logger.Info("Putting inline policy", "policyName", policyName, "roleName", roleName)
-		putInput := &iam.PutRolePolicyInput{
-			RoleName:       aws.String(roleName),
-			PolicyName:     aws.String(policyName),
-			PolicyDocument: aws.String(policyDocument),
-		}
-		_, err := iamClient.PutRolePolicy(ctx, putInput)
-		if err != nil {
-			return fmt.Errorf("failed to put inline policy %s: %w", policyName, err)
-		}
-	}
 
 	return nil
 }
