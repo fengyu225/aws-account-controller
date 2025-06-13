@@ -39,67 +39,72 @@ spec:
     from:
       name: eks-service-role
   resourcesVPCConfig:
-    subnetIDs:
-      - subnet-0e8294397b9f0b6eb
-      - subnet-0766166f3af9c4c35
+    subnetRefs:
+      - from:
+          name: test-network-private-subnet-1
+      - from:
+          name: test-network-private-subnet-2
+#    subnetIDs:
+#      - subnet-0e8294397b9f0b6eb
+#      - subnet-0766166f3af9c4c35
     endpointPublicAccess: true
     endpointPrivateAccess: false
 ---
-apiVersion: iam.services.k8s.aws/v1alpha1
-kind: Role
-metadata:
-  name: eks-node-role
-  namespace: platform
-spec:
-  name: eks-node-role
-  description: "IAM role for EKS node group instances"
-  assumeRolePolicyDocument: |
-    {
-      "Version": "2012-10-17",
-      "Statement": [
-        {
-          "Effect": "Allow",
-          "Principal": {
-            "Service": "ec2.amazonaws.com"
-          },
-          "Action": "sts:AssumeRole"
-        }
-      ]
-    }
-  policies:
-    - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-    - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-    - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-    - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-  tags:
-    - key: "Purpose"
-      value: "EKS-NodeGroup-Role"
-    - key: "ManagedBy"
-      value: "ACK"
----
-apiVersion: eks.services.k8s.aws/v1alpha1
-kind: Nodegroup
-metadata:
-  name: spire-eks-nodegroup
-  namespace: platform
-spec:
-  name: spire-eks-nodegroup
-  clusterRef:
-    from:
-      name: spire-eks
-  nodeRoleRef:
-    from:
-      name: eks-node-role
-  subnets:
-    - subnet-0e8294397b9f0b6eb
-    - subnet-0766166f3af9c4c35
-  scalingConfig:
-    minSize: 1
-    maxSize: 1
-    desiredSize: 1
-  updateConfig:
-    maxUnavailable: 1
-  instanceTypes:
-    - t3.medium
-  diskSize: 20
-  amiType: AL2_x86_64
+#apiVersion: iam.services.k8s.aws/v1alpha1
+#kind: Role
+#metadata:
+#  name: eks-node-role
+#  namespace: platform
+#spec:
+#  name: eks-node-role
+#  description: "IAM role for EKS node group instances"
+#  assumeRolePolicyDocument: |
+#    {
+#      "Version": "2012-10-17",
+#      "Statement": [
+#        {
+#          "Effect": "Allow",
+#          "Principal": {
+#            "Service": "ec2.amazonaws.com"
+#          },
+#          "Action": "sts:AssumeRole"
+#        }
+#      ]
+#    }
+#  policies:
+#    - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+#    - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+#    - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+#    - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+#  tags:
+#    - key: "Purpose"
+#      value: "EKS-NodeGroup-Role"
+#    - key: "ManagedBy"
+#      value: "ACK"
+#---
+#apiVersion: eks.services.k8s.aws/v1alpha1
+#kind: Nodegroup
+#metadata:
+#  name: spire-eks-nodegroup
+#  namespace: platform
+#spec:
+#  name: spire-eks-nodegroup
+#  clusterRef:
+#    from:
+#      name: spire-eks
+#  nodeRoleRef:
+#    from:
+#      name: eks-node-role
+#  subnets:
+#    - subnet-0e8294397b9f0b6eb
+#    - subnet-0766166f3af9c4c35
+#  scalingConfig:
+#    minSize: 1
+#    maxSize: 1
+#    desiredSize: 1
+#  updateConfig:
+#    maxUnavailable: 1
+#  instanceTypes:
+#    - t3.medium
+#  diskSize: 20
+#  amiType: AL2_x86_64

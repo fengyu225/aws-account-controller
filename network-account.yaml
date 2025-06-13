@@ -16,3 +16,4 @@ spec:
     - roleName: "ACK-CrossAccount-Network"
       services:
         - serviceName: ec2
+        - serviceName: ram

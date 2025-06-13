@@ -34,20 +34,53 @@ spec:
     - key: Type
       value: private
 ---
-apiVersion: ec2.services.k8s.aws/v1alpha1
-kind: Subnet
+apiVersion: ram.services.k8s.aws/v1alpha1
+kind: ResourceShare
 metadata:
-  name: test-network-private-subnet-2
+  name: test-network-vpc-share
   namespace: network
 spec:
-  availabilityZone: us-west-2b
-  cidrBlock: "10.0.11.0/24"
-  mapPublicIPOnLaunch: false
-  vpcRef:
-    from:
-      name: test-network-vpc
+  name: "test-network-vpc-resource-share"
+  resourceARNs:
+    - "arn:aws:ec2:us-west-2:959975881733:subnet/subnet-0f12bc585a7c7570e"
+    - "arn:aws:ec2:us-west-2:959975881733:subnet/subnet-03717139dae00d3c8"
+  principals:
+    - "090172996355"
+  allowExternalPrincipals: false
   tags:
-    - key: Name
-      value: test-network-private-subnet-2
-    - key: Type
-      value: private
+    - key: Purpose
+      value: vpc-sharing
+    - key: ManagedBy
+      value: ACK
+    - key: Environment
+      value: network
+---
+apiVersion: services.k8s.aws/v1alpha1
+kind: AdoptedResource
+metadata:
+  name: adopted-test-network-private-subnet-1
+  namespace: platform
+spec:
+  aws:
+    nameOrID: "subnet-0f12bc585a7c7570e"
+  kubernetes:
+    group: ec2.services.k8s.aws
+    kind: Subnet
+    metadata:
+      name: test-network-private-subnet-1
+      namespace: platform
+---
+apiVersion: services.k8s.aws/v1alpha1
+kind: AdoptedResource
+metadata:
+  name: adopted-test-network-private-subnet-2
+  namespace: platform
+spec:
+  aws:
+    nameOrID: "subnet-03717139dae00d3c8"
+  kubernetes:
+    group: ec2.services.k8s.aws
+    kind: Subnet
+    metadata:
+      name: test-network-private-subnet-2
+      namespace: platform

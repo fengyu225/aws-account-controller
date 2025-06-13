@@ -8,7 +8,7 @@ import (
 type ACKService struct {
 	// ServiceName is the name of the ACK service (e.g., "eks", "s3", "rds")
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=eks;s3;rds;dynamodb;ec2;ecr;iam;lambda;sqs;sns
+	// +kubebuilder:validation:Enum=eks;s3;rds;dynamodb;ec2;ecr;iam;lambda;sqs;sns;ram
 	ServiceName string `json:"serviceName"`
 
 	// ControllerRoleARN is the ARN of the ACK controller role that will assume the cross-account role

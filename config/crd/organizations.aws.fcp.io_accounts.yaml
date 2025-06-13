@@ -103,6 +103,7 @@ spec:
                             - lambda
                             - sqs
                             - sns
+                            - ram
                             type: string
                         required:
                         - serviceName

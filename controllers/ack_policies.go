@@ -200,4 +200,10 @@ var ACKPolicies = map[string]ACKServicePolicies{
 		},
 		InlinePolicy: "",
 	},
+	"ram": {
+		ManagedPolicyARNs: []string{
+			"arn:aws:iam::aws:policy/AWSResourceAccessManagerFullAccess",
+		},
+		InlinePolicy: "",
+	},
 }
