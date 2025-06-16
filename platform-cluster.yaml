@@ -39,11 +39,14 @@ spec:
     from:
       name: eks-service-role
   resourcesVPCConfig:
-    subnetRefs:
-      - from:
-          name: test-network-private-subnet-1
-      - from:
-          name: test-network-private-subnet-2
+    subnetIDs:
+      - subnet-0f12bc585a7c7570e
+      - subnet-03717139dae00d3c8
+#    subnetRefs:
+#      - from:
+#          name: test-network-private-subnet-1
+#      - from:
+#          name: test-network-private-subnet-2
 #    subnetIDs:
 #      - subnet-0e8294397b9f0b6eb
 #      - subnet-0766166f3af9c4c35

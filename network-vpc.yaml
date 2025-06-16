@@ -34,6 +34,24 @@ spec:
     - key: Type
       value: private
 ---
+apiVersion: ec2.services.k8s.aws/v1alpha1
+kind: Subnet
+metadata:
+  name: test-network-private-subnet-2
+  namespace: network
+spec:
+  availabilityZone: us-west-2a
+  cidrBlock: "10.0.11.0/24"
+  mapPublicIPOnLaunch: false
+  vpcRef:
+    from:
+      name: test-network-vpc
+  tags:
+    - key: Name
+      value: test-network-private-subnet-2
+    - key: Type
+      value: private
+---
 apiVersion: ram.services.k8s.aws/v1alpha1
 kind: ResourceShare
 metadata:

@@ -56,6 +56,13 @@ type AccountReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+func isAdoptedAccount(account *organizationsv1alpha1.Account) bool {
+	if skip, exists := account.Annotations["organizations.aws.fcp.io/skip-reconcile"]; exists && skip == "true" {
+		return true
+	}
+	return false
+}
+
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/finalizers,verbs=update
@@ -87,6 +94,22 @@ func (r *AccountReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	if isAdoptedAccount(&account) {
+		logger.Info("Account is currently being adopted, skipping reconciliation",
+			"name", account.Name,
+			"namespace", account.Namespace)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if account.Status.AccountId != "" {
+		// This is either an adopted account or previously created account
+		logger.Info("Processing existing account",
+			"accountId", account.Status.AccountId,
+			"adoptedFrom", account.Annotations["organizations.aws.fcp.io/adopted-from"])
+
+		return r.handleExistingAccount(ctx, &account)
 	}
 
 	// Check if we've already reconciled this generation
@@ -149,6 +172,52 @@ func (r *AccountReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 }
 
+// handleExistingAccount handles existing accounts (both adopted and created)
+func (r *AccountReconciler) handleExistingAccount(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if err := r.updateNamespaceAnnotation(ctx, account); err != nil {
+		logger.Error(err, "failed to update namespace annotation")
+	}
+
+	if account.Status.ObservedGeneration == account.Generation &&
+		!account.Status.LastReconcileTime.IsZero() &&
+		time.Since(account.Status.LastReconcileTime.Time) < fullReconcileInterval {
+		nextReconcile := fullReconcileInterval - time.Since(account.Status.LastReconcileTime.Time)
+		logger.Info("Account already reconciled for this generation",
+			"accountId", account.Status.AccountId,
+			"generation", account.Generation,
+			"nextReconcileIn", nextReconcile)
+		return ctrl.Result{RequeueAfter: nextReconcile}, nil
+	}
+
+	if len(account.Spec.ACKServicesIAMRoles) > 0 {
+		logger.Info("Reconciling ACK IAM roles for account",
+			"accountId", account.Status.AccountId,
+			"roleCount", len(account.Spec.ACKServicesIAMRoles))
+
+		result, err := r.handleMultipleCrossAccountRoles(ctx, account)
+		if err != nil {
+			logger.Error(err, "failed to reconcile ACK roles")
+			return result, err
+		}
+	}
+
+	account.Status.ObservedGeneration = account.Generation
+	account.Status.LastReconcileTime = metav1.Now()
+
+	if err := r.Status().Update(ctx, account); err != nil {
+		logger.Error(err, "failed to update status")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Successfully reconciled existing account",
+		"accountId", account.Status.AccountId,
+		"generation", account.Generation)
+
+	return ctrl.Result{RequeueAfter: fullReconcileInterval}, nil
+}
+
 // handleAccountDeletion handles the deletion of an AWS account
 func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -196,6 +265,11 @@ func (r *AccountReconciler) updateNamespaceAnnotation(ctx context.Context, accou
 
 	if err := r.Get(ctx, namespaceName, namespace); err != nil {
 		return fmt.Errorf("failed to get namespace %s: %w", account.Namespace, err)
+	}
+
+	if namespace.Annotations != nil &&
+		namespace.Annotations[ownerAccountIDAnnotation] == account.Status.AccountId {
+		return nil
 	}
 
 	if namespace.Annotations == nil {

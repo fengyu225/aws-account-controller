@@ -18,6 +18,7 @@ rules:
   - organizations.aws.fcp.io
   resources:
   - accounts
+  - adoptedaccounts
   verbs:
   - create
   - delete
@@ -30,12 +31,14 @@ rules:
   - organizations.aws.fcp.io
   resources:
   - accounts/finalizers
+  - adoptedaccounts/finalizers
   verbs:
   - update
 - apiGroups:
   - organizations.aws.fcp.io
   resources:
   - accounts/status
+  - adoptedaccounts/status
   verbs:
   - get
   - patch
