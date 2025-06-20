@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+---
+apiVersion: organizations.aws.fcp.io/v1alpha1
+kind: AdoptedAccount
+metadata:
+  name: adopt-test-account
+  namespace: platform
+spec:
+  aws:
+    accountID: "090172996355"
+  kubernetes:
+    group: organizations.aws.fcp.io
+    kind: Account
+    metadata:
+      name: test-platform-account
+      namespace: platform

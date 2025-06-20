@@ -40,7 +40,7 @@ metadata:
   name: test-network-private-subnet-2
   namespace: network
 spec:
-  availabilityZone: us-west-2a
+  availabilityZone: us-west-2b
   cidrBlock: "10.0.11.0/24"
   mapPublicIPOnLaunch: false
   vpcRef:
@@ -52,53 +52,45 @@ spec:
     - key: Type
       value: private
 ---
-apiVersion: ram.services.k8s.aws/v1alpha1
-kind: ResourceShare
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: test-network-vpc-share
+  name: subnet-arns
+  namespace: network
+data:
+  subnet1-arn: ""
+  subnet2-arn: ""
+---
+apiVersion: services.k8s.aws/v1alpha1
+kind: FieldExport
+metadata:
+  name: test-network-private-subnet-1-arn
   namespace: network
 spec:
-  name: "test-network-vpc-resource-share"
-  resourceARNs:
-    - "arn:aws:ec2:us-west-2:959975881733:subnet/subnet-0f12bc585a7c7570e"
-    - "arn:aws:ec2:us-west-2:959975881733:subnet/subnet-03717139dae00d3c8"
-  principals:
-    - "090172996355"
-  allowExternalPrincipals: false
-  tags:
-    - key: Purpose
-      value: vpc-sharing
-    - key: ManagedBy
-      value: ACK
-    - key: Environment
-      value: network
----
-apiVersion: services.k8s.aws/v1alpha1
-kind: AdoptedResource
-metadata:
-  name: adopted-test-network-private-subnet-1
-  namespace: platform
-spec:
-  aws:
-    nameOrID: "subnet-0f12bc585a7c7570e"
-  kubernetes:
-    group: ec2.services.k8s.aws
-    kind: Subnet
-    metadata:
+  from:
+    resource:
+      group: ec2.services.k8s.aws
+      kind: Subnet
       name: test-network-private-subnet-1
-      namespace: platform
+    path: ".status.ackResourceMetadata.arn"
+  to:
+    kind: configmap
+    name: subnet-arns
+    key: subnet1-arn
 ---
 apiVersion: services.k8s.aws/v1alpha1
-kind: AdoptedResource
+kind: FieldExport
 metadata:
-  name: adopted-test-network-private-subnet-2
-  namespace: platform
+  name: test-network-private-subnet-2-arn
+  namespace: network
 spec:
-  aws:
-    nameOrID: "subnet-03717139dae00d3c8"
-  kubernetes:
-    group: ec2.services.k8s.aws
-    kind: Subnet
-    metadata:
+  from:
+    resource:
+      group: ec2.services.k8s.aws
+      kind: Subnet
       name: test-network-private-subnet-2
-      namespace: platform
+    path: ".status.ackResourceMetadata.arn"
+  to:
+    kind: configmap
+    name: subnet-arns
+    key: subnet2-arn

@@ -1,0 +1,50 @@
+apiVersion: ram.services.k8s.aws/v1alpha1
+kind: ResourceShare
+metadata:
+  name: test-network-vpc-share
+  namespace: network
+spec:
+  name: "test-network-vpc-resource-share"
+  resourceARNs:
+    -  arn:aws:ec2:us-west-2:242343576447:subnet/subnet-0591f34a8fe915c76
+    -  arn:aws:ec2:us-west-2:242343576447:subnet/subnet-0382c131d453baebb
+  principals:
+    - "090172996355"
+  allowExternalPrincipals: false
+  tags:
+    - key: Purpose
+      value: vpc-sharing
+    - key: ManagedBy
+      value: ACK
+    - key: Environment
+      value: network
+---
+apiVersion: services.k8s.aws/v1alpha1
+kind: AdoptedResource
+metadata:
+  name: adopted-test-network-private-subnet-1
+  namespace: platform
+spec:
+  aws:
+    nameOrID: "subnet-0591f34a8fe915c76"
+  kubernetes:
+    group: ec2.services.k8s.aws
+    kind: Subnet
+    metadata:
+      name: shared-network-private-subnet-1
+      namespace: platform
+---
+apiVersion: services.k8s.aws/v1alpha1
+kind: AdoptedResource
+metadata:
+  name: adopted-test-network-private-subnet-2
+  namespace: platform
+spec:
+  aws:
+    nameOrID: "subnet-0382c131d453baebb"
+  kubernetes:
+    group: ec2.services.k8s.aws
+    kind: Subnet
+    metadata:
+      name: shared-network-private-subnet-2
+      namespace: platform
