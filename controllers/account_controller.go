@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/aws/aws-sdk-go-v2/service/organizations/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -67,6 +68,7 @@ func isAdoptedAccount(account *organizationsv1alpha1.Account) bool {
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // AWS Permissions needed: organizations:CreateAccount,organizations:DescribeCreateAccountStatus,organizations:ListParents,organizations:MoveAccount,organizations:TagResource,organizations:CloseAccount
 
 // Reconcile is part of the main kubernetes reconciliation loop
@@ -191,16 +193,11 @@ func (r *AccountReconciler) handleExistingAccount(ctx context.Context, account *
 		return ctrl.Result{RequeueAfter: nextReconcile}, nil
 	}
 
-	if len(account.Spec.ACKServicesIAMRoles) > 0 {
-		logger.Info("Reconciling ACK IAM roles for account",
-			"accountId", account.Status.AccountId,
-			"roleCount", len(account.Spec.ACKServicesIAMRoles))
-
-		result, err := r.handleMultipleCrossAccountRoles(ctx, account)
-		if err != nil {
-			logger.Error(err, "failed to reconcile ACK roles")
-			return result, err
-		}
+	// Reconcile both ACK roles and initial users
+	result, err := r.reconcileAccountResources(ctx, account)
+	if err != nil {
+		logger.Error(err, "failed to reconcile account resources")
+		return result, err
 	}
 
 	account.Status.ObservedGeneration = account.Generation
@@ -234,6 +231,14 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 	}
 
 	if account.Status.AccountId != "" {
+		// Clean up initial users
+		if len(account.Status.InitialUsers) > 0 {
+			if err := r.cleanupAllInitialUsers(ctx, account); err != nil {
+				logger.Error(err, "failed to cleanup initial users")
+			}
+		}
+
+		// Clean up cross-account roles
 		if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
 			logger.Error(err, "failed to cleanup cross-account roles")
 		}
@@ -459,22 +464,475 @@ func (r *AccountReconciler) handleSucceededAccount(ctx context.Context, account 
 func (r *AccountReconciler) reconcileAccountResources(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Reconcile ACK IAM roles
 	if len(account.Spec.ACKServicesIAMRoles) > 0 {
 		logger.Info("Reconciling ACK IAM roles", "accountId", account.Status.AccountId, "roleCount", len(account.Spec.ACKServicesIAMRoles))
-		return r.handleMultipleCrossAccountRoles(ctx, account)
+		result, err := r.handleMultipleCrossAccountRoles(ctx, account)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		logger.Info("No ACK service roles specified", "accountId", account.Status.AccountId)
+		if len(account.Status.CrossAccountRoles) > 0 {
+			logger.Info("Cleaning up existing roles as none are specified in spec")
+			if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
+				logger.Error(err, "failed to cleanup existing roles")
+			}
+			account.Status.CrossAccountRoles = []organizationsv1alpha1.CrossAccountRoleStatus{}
+		}
 	}
 
-	logger.Info("No ACK service roles specified", "accountId", account.Status.AccountId)
-
-	if len(account.Status.CrossAccountRoles) > 0 {
-		logger.Info("Cleaning up existing roles as none are specified in spec")
-		if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
-			logger.Error(err, "failed to cleanup existing roles")
+	// Reconcile initial users
+	if len(account.Spec.InitialUsers) > 0 || len(account.Status.InitialUsers) > 0 {
+		logger.Info("Reconciling initial users", "accountId", account.Status.AccountId, "userCount", len(account.Spec.InitialUsers))
+		if err := r.reconcileInitialUsers(ctx, account); err != nil {
+			logger.Error(err, "failed to reconcile initial users")
+			r.updateCondition(account, "InitialUsersReady", metav1.ConditionFalse, "UserReconciliationFailed", err.Error())
+			return ctrl.Result{RequeueAfter: time.Minute}, err
 		}
-		account.Status.CrossAccountRoles = []organizationsv1alpha1.CrossAccountRoleStatus{}
+		r.updateCondition(account, "InitialUsersReady", metav1.ConditionTrue, "UsersReconciled", fmt.Sprintf("Successfully reconciled %d initial users", len(account.Spec.InitialUsers)))
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// reconcileInitialUsers handles creation and management of initial IAM users
+func (r *AccountReconciler) reconcileInitialUsers(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	if len(account.Spec.InitialUsers) == 0 {
+		// Clean up any existing users if spec is empty
+		if len(account.Status.InitialUsers) > 0 {
+			logger.Info("Cleaning up existing users as none specified in spec")
+			if err := r.cleanupAllInitialUsers(ctx, account); err != nil {
+				logger.Error(err, "failed to cleanup existing users")
+			}
+			account.Status.InitialUsers = []organizationsv1alpha1.InitialUserStatus{}
+		}
+		return nil
+	}
+
+	iamClient, err := r.getIAMClientForAccount(ctx, account.Status.AccountId)
+	if err != nil {
+		return fmt.Errorf("failed to get IAM client for account %s: %w", account.Status.AccountId, err)
+	}
+
+	managedUsers := make(map[string]bool)
+	newUserStatuses := []organizationsv1alpha1.InitialUserStatus{}
+
+	for _, userSpec := range account.Spec.InitialUsers {
+		managedUsers[userSpec.Username] = true
+
+		userStatus := organizationsv1alpha1.InitialUserStatus{
+			Username: userSpec.Username,
+			State:    "CREATING",
+		}
+
+		if err := r.createOrUpdateInitialUser(ctx, iamClient, account, userSpec, &userStatus); err != nil {
+			logger.Error(err, "failed to create/update user", "username", userSpec.Username)
+			userStatus.State = "FAILED"
+			userStatus.FailureReason = err.Error()
+		} else {
+			userStatus.State = "READY"
+		}
+
+		userStatus.LastUpdated = metav1.Now()
+		newUserStatuses = append(newUserStatuses, userStatus)
+	}
+
+	// Clean up users no longer in spec
+	for _, existingUser := range account.Status.InitialUsers {
+		if !managedUsers[existingUser.Username] {
+			logger.Info("Removing user no longer in spec", "username", existingUser.Username)
+			if err := r.cleanupSingleUser(ctx, iamClient, account, existingUser.Username, existingUser.SecretName); err != nil {
+				logger.Error(err, "failed to cleanup removed user", "username", existingUser.Username)
+			}
+		}
+	}
+
+	account.Status.InitialUsers = newUserStatuses
+	return nil
+}
+
+// createOrUpdateInitialUser creates or updates an IAM user and their credentials
+func (r *AccountReconciler) createOrUpdateInitialUser(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, userSpec organizationsv1alpha1.InitialUser, userStatus *organizationsv1alpha1.InitialUserStatus) error {
+	logger := log.FromContext(ctx)
+
+	// Check if user exists
+	getUserInput := &iam.GetUserInput{
+		UserName: aws.String(userSpec.Username),
+	}
+
+	existingUser, err := iamClient.GetUser(ctx, getUserInput)
+	if err != nil {
+		// User doesn't exist, create it
+		logger.Info("Creating IAM user", "username", userSpec.Username, "accountId", account.Status.AccountId)
+
+		createUserInput := &iam.CreateUserInput{
+			UserName: aws.String(userSpec.Username),
+			Path:     aws.String("/"),
+		}
+
+		if len(userSpec.Tags) > 0 {
+			tags := make([]iamtypes.Tag, 0, len(userSpec.Tags))
+			for key, value := range userSpec.Tags {
+				tags = append(tags, iamtypes.Tag{
+					Key:   aws.String(key),
+					Value: aws.String(value),
+				})
+			}
+			createUserInput.Tags = tags
+		}
+
+		_, err = iamClient.CreateUser(ctx, createUserInput)
+		if err != nil {
+			return fmt.Errorf("failed to create user: %w", err)
+		}
+	} else {
+		logger.Info("User already exists, updating configuration", "username", userSpec.Username)
+		_ = existingUser
+	}
+
+	// Attach managed policies
+	if err := r.reconcileUserManagedPolicies(ctx, iamClient, userSpec.Username, userSpec.ManagedPolicyARNs); err != nil {
+		return fmt.Errorf("failed to reconcile managed policies: %w", err)
+	}
+
+	// Attach inline policy if specified
+	if userSpec.InlinePolicy != "" {
+		policyName := fmt.Sprintf("%s-inline-policy", userSpec.Username)
+		putPolicyInput := &iam.PutUserPolicyInput{
+			UserName:       aws.String(userSpec.Username),
+			PolicyName:     aws.String(policyName),
+			PolicyDocument: aws.String(userSpec.InlinePolicy),
+		}
+
+		_, err = iamClient.PutUserPolicy(ctx, putPolicyInput)
+		if err != nil {
+			return fmt.Errorf("failed to attach inline policy: %w", err)
+		}
+	}
+
+	// Add user to groups
+	for _, groupName := range userSpec.Groups {
+		addUserToGroupInput := &iam.AddUserToGroupInput{
+			UserName:  aws.String(userSpec.Username),
+			GroupName: aws.String(groupName),
+		}
+
+		_, err = iamClient.AddUserToGroup(ctx, addUserToGroupInput)
+		if err != nil {
+			logger.Error(err, "failed to add user to group", "username", userSpec.Username, "group", groupName)
+		}
+	}
+
+	// Generate access key if requested
+	shouldGenerateKey := userSpec.GenerateAccessKey == nil || *userSpec.GenerateAccessKey
+	if shouldGenerateKey {
+		if err := r.ensureUserAccessKey(ctx, iamClient, account, userSpec, userStatus); err != nil {
+			return fmt.Errorf("failed to ensure access key: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ensureUserAccessKey ensures the user has an access key and stores it in a secret
+func (r *AccountReconciler) ensureUserAccessKey(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, userSpec organizationsv1alpha1.InitialUser, userStatus *organizationsv1alpha1.InitialUserStatus) error {
+	logger := log.FromContext(ctx)
+
+	// Check if user already has access keys
+	listKeysInput := &iam.ListAccessKeysInput{
+		UserName: aws.String(userSpec.Username),
+	}
+
+	keysResult, err := iamClient.ListAccessKeys(ctx, listKeysInput)
+	if err != nil {
+		return fmt.Errorf("failed to list access keys: %w", err)
+	}
+
+	secretName := userSpec.SecretName
+	if secretName == "" {
+		secretName = fmt.Sprintf("aws-user-%s", userSpec.Username)
+	}
+	userStatus.SecretName = secretName
+
+	// If user already has an access key, check if we have the secret
+	if len(keysResult.AccessKeyMetadata) > 0 {
+		keyId := *keysResult.AccessKeyMetadata[0].AccessKeyId
+		userStatus.AccessKeyId = keyId
+		userStatus.HasAccessKey = true
+
+		// Check if secret exists
+		secret := &corev1.Secret{}
+		secretKey := k8stypes.NamespacedName{
+			Name:      secretName,
+			Namespace: account.Namespace,
+		}
+
+		if err := r.Get(ctx, secretKey, secret); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Info("Access key exists but secret is missing, will recreate access key",
+					"username", userSpec.Username, "keyId", keyId)
+
+				// Delete existing key and create new one
+				deleteKeyInput := &iam.DeleteAccessKeyInput{
+					UserName:    aws.String(userSpec.Username),
+					AccessKeyId: aws.String(keyId),
+				}
+				_, err = iamClient.DeleteAccessKey(ctx, deleteKeyInput)
+				if err != nil {
+					return fmt.Errorf("failed to delete existing access key: %w", err)
+				}
+			} else {
+				return fmt.Errorf("failed to get secret: %w", err)
+			}
+		} else {
+			logger.Info("User access key and secret already exist", "username", userSpec.Username, "keyId", keyId)
+			return nil
+		}
+	}
+
+	// Create new access key
+	logger.Info("Creating access key for user", "username", userSpec.Username)
+	createKeyInput := &iam.CreateAccessKeyInput{
+		UserName: aws.String(userSpec.Username),
+	}
+
+	keyResult, err := iamClient.CreateAccessKey(ctx, createKeyInput)
+	if err != nil {
+		return fmt.Errorf("failed to create access key: %w", err)
+	}
+
+	userStatus.AccessKeyId = *keyResult.AccessKey.AccessKeyId
+	userStatus.HasAccessKey = true
+
+	// Create Kubernetes secret with credentials
+	secretData := map[string][]byte{
+		"aws-access-key-id":     []byte(*keyResult.AccessKey.AccessKeyId),
+		"aws-secret-access-key": []byte(*keyResult.AccessKey.SecretAccessKey),
+		"aws-account-id":        []byte(account.Status.AccountId),
+		"username":              []byte(userSpec.Username),
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: account.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "aws-account-controller",
+				"aws-account-controller/type":  "user-credentials",
+				"aws-account-controller/user":  userSpec.Username,
+			},
+			Annotations: map[string]string{
+				"aws-account-controller/account-id": account.Status.AccountId,
+				"aws-account-controller/username":   userSpec.Username,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: secretData,
+	}
+
+	// Set owner reference to the Account resource
+	if err := controllerutil.SetControllerReference(account, secret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference: %w", err)
+	}
+
+	if err := r.Create(ctx, secret); err != nil {
+		if errors.IsAlreadyExists(err) {
+			// Update existing secret
+			existingSecret := &corev1.Secret{}
+			if err := r.Get(ctx, k8stypes.NamespacedName{Name: secretName, Namespace: account.Namespace}, existingSecret); err != nil {
+				return fmt.Errorf("failed to get existing secret: %w", err)
+			}
+
+			existingSecret.Data = secretData
+			if err := r.Update(ctx, existingSecret); err != nil {
+				return fmt.Errorf("failed to update secret: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create secret: %w", err)
+		}
+	}
+
+	logger.Info("Successfully created access key and secret",
+		"username", userSpec.Username,
+		"keyId", *keyResult.AccessKey.AccessKeyId,
+		"secretName", secretName)
+
+	return nil
+}
+
+// reconcileUserManagedPolicies ensures the user has the correct managed policies attached
+func (r *AccountReconciler) reconcileUserManagedPolicies(ctx context.Context, iamClient *iam.Client, username string, desiredPolicies []string) error {
+	logger := log.FromContext(ctx)
+
+	// Get currently attached policies
+	listInput := &iam.ListAttachedUserPoliciesInput{
+		UserName: aws.String(username),
+	}
+
+	currentPolicies, err := iamClient.ListAttachedUserPolicies(ctx, listInput)
+	if err != nil {
+		return fmt.Errorf("failed to list attached policies: %w", err)
+	}
+
+	currentPolicyMap := make(map[string]bool)
+	for _, policy := range currentPolicies.AttachedPolicies {
+		currentPolicyMap[*policy.PolicyArn] = true
+	}
+
+	desiredPolicyMap := make(map[string]bool)
+	for _, arn := range desiredPolicies {
+		desiredPolicyMap[arn] = true
+	}
+
+	// Detach policies that shouldn't be attached
+	for policyArn := range currentPolicyMap {
+		if !desiredPolicyMap[policyArn] {
+			logger.Info("Detaching policy from user", "username", username, "policyArn", policyArn)
+			detachInput := &iam.DetachUserPolicyInput{
+				UserName:  aws.String(username),
+				PolicyArn: aws.String(policyArn),
+			}
+			_, err := iamClient.DetachUserPolicy(ctx, detachInput)
+			if err != nil {
+				return fmt.Errorf("failed to detach policy %s: %w", policyArn, err)
+			}
+		}
+	}
+
+	// Attach policies that should be attached
+	for policyArn := range desiredPolicyMap {
+		if !currentPolicyMap[policyArn] {
+			logger.Info("Attaching policy to user", "username", username, "policyArn", policyArn)
+			attachInput := &iam.AttachUserPolicyInput{
+				UserName:  aws.String(username),
+				PolicyArn: aws.String(policyArn),
+			}
+			_, err := iamClient.AttachUserPolicy(ctx, attachInput)
+			if err != nil {
+				return fmt.Errorf("failed to attach policy %s: %w", policyArn, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// cleanupAllInitialUsers removes all initial users and their credentials
+func (r *AccountReconciler) cleanupAllInitialUsers(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	iamClient, err := r.getIAMClientForAccount(ctx, account.Status.AccountId)
+	if err != nil {
+		return fmt.Errorf("failed to get IAM client: %w", err)
+	}
+
+	for _, userStatus := range account.Status.InitialUsers {
+		if err := r.cleanupSingleUser(ctx, iamClient, account, userStatus.Username, userStatus.SecretName); err != nil {
+			return fmt.Errorf("failed to cleanup user %s: %w", userStatus.Username, err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupSingleUser removes a single IAM user and their secret
+func (r *AccountReconciler) cleanupSingleUser(ctx context.Context, iamClient *iam.Client, account *organizationsv1alpha1.Account, username, secretName string) error {
+	logger := log.FromContext(ctx)
+
+	// Delete access keys
+	listKeysInput := &iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	}
+
+	keysResult, err := iamClient.ListAccessKeys(ctx, listKeysInput)
+	if err == nil {
+		for _, keyMetadata := range keysResult.AccessKeyMetadata {
+			deleteKeyInput := &iam.DeleteAccessKeyInput{
+				UserName:    aws.String(username),
+				AccessKeyId: keyMetadata.AccessKeyId,
+			}
+			_, err = iamClient.DeleteAccessKey(ctx, deleteKeyInput)
+			if err != nil {
+				logger.Error(err, "failed to delete access key", "username", username, "keyId", *keyMetadata.AccessKeyId)
+			}
+		}
+	}
+
+	// Detach managed policies
+	listAttachedInput := &iam.ListAttachedUserPoliciesInput{
+		UserName: aws.String(username),
+	}
+
+	attachedPolicies, err := iamClient.ListAttachedUserPolicies(ctx, listAttachedInput)
+	if err == nil {
+		for _, policy := range attachedPolicies.AttachedPolicies {
+			detachInput := &iam.DetachUserPolicyInput{
+				UserName:  aws.String(username),
+				PolicyArn: policy.PolicyArn,
+			}
+			_, err = iamClient.DetachUserPolicy(ctx, detachInput)
+			if err != nil {
+				logger.Error(err, "failed to detach policy", "username", username, "policyArn", *policy.PolicyArn)
+			}
+		}
+	}
+
+	// Delete inline policies
+	listInlineInput := &iam.ListUserPoliciesInput{
+		UserName: aws.String(username),
+	}
+
+	inlinePolicies, err := iamClient.ListUserPolicies(ctx, listInlineInput)
+	if err == nil {
+		for _, policyName := range inlinePolicies.PolicyNames {
+			deleteInput := &iam.DeleteUserPolicyInput{
+				UserName:   aws.String(username),
+				PolicyName: aws.String(policyName),
+			}
+			_, err = iamClient.DeleteUserPolicy(ctx, deleteInput)
+			if err != nil {
+				logger.Error(err, "failed to delete inline policy", "username", username, "policyName", policyName)
+			}
+		}
+	}
+
+	// Note: We skip explicit group cleanup here because:
+	// 1. Deleting the user will automatically remove them from all groups
+	// 2. There's no direct "GetGroupsForUser" API in AWS SDK Go v2
+	// 3. Listing all groups and checking membership is inefficient
+
+	// Delete the IAM user (this automatically removes them from all groups)
+	deleteUserInput := &iam.DeleteUserInput{
+		UserName: aws.String(username),
+	}
+
+	_, err = iamClient.DeleteUser(ctx, deleteUserInput)
+	if err != nil {
+		logger.Error(err, "failed to delete IAM user", "username", username)
+	} else {
+		logger.Info("Successfully deleted IAM user", "username", username)
+	}
+
+	// Delete the Kubernetes secret
+	if secretName != "" {
+		secret := &corev1.Secret{}
+		secretKey := k8stypes.NamespacedName{
+			Name:      secretName,
+			Namespace: account.Namespace,
+		}
+
+		if err := r.Get(ctx, secretKey, secret); err == nil {
+			if err := r.Delete(ctx, secret); err != nil {
+				logger.Error(err, "failed to delete secret", "secretName", secretName)
+			} else {
+				logger.Info("Successfully deleted secret", "secretName", secretName)
+			}
+		}
+	}
+
+	logger.Info("Successfully cleaned up user", "username", username)
+	return nil
 }
 
 // handleMultipleCrossAccountRoles creates/updates multiple IAM roles based on ACKServicesIAMRoles

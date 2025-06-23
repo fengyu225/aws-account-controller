@@ -64,6 +64,54 @@ spec:
                 required:
                 - accountID
                 type: object
+              initialUsers:
+                description: InitialUsers specifies IAM users to create in the adopted
+                  account
+                items:
+                  description: InitialUser defines an IAM user to create in the new/adopted
+                    account
+                  properties:
+                    generateAccessKey:
+                      default: true
+                      description: GenerateAccessKey determines whether to generate
+                        an access key for this user
+                      type: boolean
+                    groups:
+                      description: Groups specifies the IAM groups to add the user
+                        to
+                      items:
+                        type: string
+                      type: array
+                    inlinePolicy:
+                      description: InlinePolicy specifies an inline policy document
+                        to attach to the user
+                      type: string
+                    managedPolicyARNs:
+                      description: ManagedPolicyARNs specifies managed policies to
+                        attach directly to the user
+                      items:
+                        type: string
+                      type: array
+                    secretName:
+                      description: |-
+                        SecretName specifies the name of the Kubernetes secret to store credentials
+                        If not specified, defaults to "aws-user-{username}"
+                      type: string
+                    tags:
+                      additionalProperties:
+                        type: string
+                      description: Tags specifies tags to apply to the IAM user
+                      type: object
+                    username:
+                      description: Username is the IAM username to create
+                      maxLength: 64
+                      minLength: 1
+                      pattern: ^[a-zA-Z][a-zA-Z0-9+=,.@_-]*$
+                      type: string
+                  required:
+                  - username
+                  type: object
+                type: array
               kubernetes:
                 description: Kubernetes contains the target Kubernetes object details
                 properties:
@@ -168,6 +216,48 @@ spec:
                 description: FailureReason provides the reason for failure if state
                   is FAILED
                 type: string
+              initialUsers:
+                description: InitialUsers contains the status of all initial users
+                items:
+                  description: InitialUserStatus represents the status of an initial
+                    user creation
+                  properties:
+                    accessKeyId:
+                      description: AccessKeyId is the access key ID (non-sensitive)
+                      type: string
+                    failureReason:
+                      description: FailureReason provides the reason for failure if
+                        state is FAILED
+                      type: string
+                    hasAccessKey:
+                      description: HasAccessKey indicates whether an access key was
+                        generated
+                      type: boolean
+                    lastUpdated:
+                      description: LastUpdated is the last time this user was updated
+                      format: date-time
+                      type: string
+                    secretName:
+                      description: SecretName is the name of the Kubernetes secret
+                        containing credentials
+                      type: string
+                    state:
+                      description: State represents the current state of user creation
+                      enum:
+                      - CREATING
+                      - READY
+                      - FAILED
+                      - UPDATING
+                      type: string
+                    username:
+                      description: Username is the IAM username
+                      type: string
+                  required:
+                  - hasAccessKey
+                  - state
+                  - username
+                  type: object
+                type: array
               observedGeneration:
                 description: ObservedGeneration is the generation observed by the
                   controller

@@ -17,3 +17,15 @@ spec:
       services:
         - serviceName: ec2
         - serviceName: ram
+  initialUsers:
+    - username: "readonly-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+      generateAccessKey: true
+      secretName: "network-readonly-credentials"
+    - username: "admin-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - "arn:aws:iam::aws:policy/IAMFullAccess"
+      generateAccessKey: true
+      secretName: "network-admin-credentials"

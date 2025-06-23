@@ -11,6 +11,10 @@ type AdoptedAccountSpec struct {
 
 	// Kubernetes contains the target Kubernetes object details
 	Kubernetes KubernetesAccountTarget `json:"kubernetes"`
+
+	// InitialUsers specifies IAM users to create in the adopted account
+	// +optional
+	InitialUsers []InitialUser `json:"initialUsers,omitempty"`
 }
 
 // AWSAccountReference specifies how to identify the existing AWS account
@@ -83,6 +87,10 @@ type AdoptedAccountStatus struct {
 	// ObservedGeneration is the generation observed by the controller
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// InitialUsers contains the status of all initial users
+	// +optional
+	InitialUsers []InitialUserStatus `json:"initialUsers,omitempty"`
 }
 
 // +kubebuilder:object:root=true

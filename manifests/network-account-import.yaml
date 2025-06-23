@@ -3,6 +3,11 @@ kind: Namespace
 metadata:
   name: network
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: network
+---
 apiVersion: organizations.aws.fcp.io/v1alpha1
 kind: AdoptedAccount
 metadata:
@@ -17,3 +22,15 @@ spec:
     metadata:
       name: test-network-account
       namespace: network
+  initialUsers:
+    - username: "readonly-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+      generateAccessKey: true
+      secretName: "network-readonly-credentials"
+    - username: "admin-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - "arn:aws:iam::aws:policy/IAMFullAccess"
+      generateAccessKey: true
+      secretName: "network-admin-credentials"

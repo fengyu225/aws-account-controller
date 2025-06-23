@@ -23,3 +23,15 @@ spec:
         - serviceName: eks
         - serviceName: iam
         - serviceName: ec2
+  initialUsers:
+    - username: "readonly-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+      generateAccessKey: true
+      secretName: "platform-readonly-credentials"
+    - username: "admin-user"
+      managedPolicyARNs:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - "arn:aws:iam::aws:policy/IAMFullAccess"
+      generateAccessKey: true
+      secretName: "platform-admin-credentials"

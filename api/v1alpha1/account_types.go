@@ -60,6 +60,10 @@ type AccountSpec struct {
 	// ACKServicesIAMRoles specifies the IAM roles to create with their associated ACK services
 	// +optional
 	ACKServicesIAMRoles []ACKServiceIAMRole `json:"ackServicesIAMRoles,omitempty"`
+
+	// InitialUsers specifies IAM users to create in the account
+	// +optional
+	InitialUsers []InitialUser `json:"initialUsers,omitempty"`
 }
 
 // CrossAccountRoleStatus represents the status of a cross-account role
@@ -116,6 +120,74 @@ type AccountStatus struct {
 	// ObservedGeneration is the generation observed by the controller
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// InitialUsers contains the status of all initial users
+	// +optional
+	InitialUsers []InitialUserStatus `json:"initialUsers,omitempty"`
+}
+
+// InitialUser defines an IAM user to create in the new/adopted account
+type InitialUser struct {
+	// Username is the IAM username to create
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9+=,.@_-]*$`
+	Username string `json:"username"`
+
+	// Groups specifies the IAM groups to add the user to
+	// +optional
+	Groups []string `json:"groups,omitempty"`
+
+	// ManagedPolicyARNs specifies managed policies to attach directly to the user
+	// +optional
+	ManagedPolicyARNs []string `json:"managedPolicyARNs,omitempty"`
+
+	// InlinePolicy specifies an inline policy document to attach to the user
+	// +optional
+	InlinePolicy string `json:"inlinePolicy,omitempty"`
+
+	// Tags specifies tags to apply to the IAM user
+	// +optional
+	Tags map[string]string `json:"tags,omitempty"`
+
+	// GenerateAccessKey determines whether to generate an access key for this user
+	// +kubebuilder:default=true
+	// +optional
+	GenerateAccessKey *bool `json:"generateAccessKey,omitempty"`
+
+	// SecretName specifies the name of the Kubernetes secret to store credentials
+	// If not specified, defaults to "aws-user-{username}"
+	// +optional
+	SecretName string `json:"secretName,omitempty"`
+}
+
+// InitialUserStatus represents the status of an initial user creation
+type InitialUserStatus struct {
+	// Username is the IAM username
+	Username string `json:"username"`
+
+	// State represents the current state of user creation
+	// +kubebuilder:validation:Enum=CREATING;READY;FAILED;UPDATING
+	State string `json:"state"`
+
+	// SecretName is the name of the Kubernetes secret containing credentials
+	// +optional
+	SecretName string `json:"secretName,omitempty"`
+
+	// AccessKeyId is the access key ID (non-sensitive)
+	// +optional
+	AccessKeyId string `json:"accessKeyId,omitempty"`
+
+	// HasAccessKey indicates whether an access key was generated
+	HasAccessKey bool `json:"hasAccessKey"`
+
+	// LastUpdated is the last time this user was updated
+	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
+
+	// FailureReason provides the reason for failure if state is FAILED
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
 }
 
 // +kubebuilder:object:root=true
