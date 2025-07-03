@@ -40,6 +40,7 @@ type AdoptedAccountReconciler struct {
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=adoptedaccounts/finalizers,verbs=update
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *AdoptedAccountReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -192,43 +193,58 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 		return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("Failed to create target Account: %v", err))
 	}
 
-	// Reconcile initial users if specified
+	// Get the target account to access its status and spec
+	targetAccount := &organizationsv1alpha1.Account{}
+	targetKey := k8stypes.NamespacedName{
+		Name:      targetAccountName,
+		Namespace: targetNamespace,
+	}
+
+	if err := r.Get(ctx, targetKey, targetAccount); err != nil {
+		logger.Error(err, "failed to get target account")
+		return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("Failed to get target account: %v", err))
+	}
+
+	// Ensure the Account has the AccountId populated
+	if targetAccount.Status.AccountId == "" {
+		logger.Error(nil, "target Account does not have AccountId populated yet",
+			"targetAccount", fmt.Sprintf("%s/%s", targetNamespace, targetAccountName))
+		return r.markAdoptionFailed(ctx, adoptedAccount, "Target Account does not have AccountId populated - this is a timing issue")
+	}
+
+	// Validate the AccountId matches what we expect
+	if targetAccount.Status.AccountId != adoptedAccount.Spec.AWS.AccountID {
+		logger.Error(nil, "target Account has different AccountId than expected",
+			"expected", adoptedAccount.Spec.AWS.AccountID,
+			"actual", targetAccount.Status.AccountId)
+		return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("AccountId mismatch: expected %s, got %s",
+			adoptedAccount.Spec.AWS.AccountID, targetAccount.Status.AccountId))
+	}
+
+	logger.Info("Target account validated, proceeding with adoption tasks",
+		"accountId", targetAccount.Status.AccountId,
+		"targetAccount", fmt.Sprintf("%s/%s", targetNamespace, targetAccountName))
+
+	// Reconcile ACK ConfigMaps if the target account has ACK service roles defined
+	if len(targetAccount.Spec.ACKServicesIAMRoles) > 0 {
+		logger.Info("Creating ACK ConfigMaps for adopted account",
+			"accountId", adoptedAccount.Spec.AWS.AccountID,
+			"roleCount", len(targetAccount.Spec.ACKServicesIAMRoles))
+
+		if err := r.createACKConfigMapsForAdoptedAccount(ctx, adoptedAccount, targetAccount); err != nil {
+			logger.Error(err, "failed to create ACK ConfigMaps for adopted account")
+			return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("Failed to create ACK ConfigMaps: %v", err))
+		}
+
+		r.updateCondition(adoptedAccount, "ACKConfigMapsReady", metav1.ConditionTrue, "ConfigMapsCreated",
+			fmt.Sprintf("Successfully created ConfigMaps for %d ACK roles", len(targetAccount.Spec.ACKServicesIAMRoles)))
+	}
+
+	// Reconcile initial users if specified in the AdoptedAccount
 	if len(adoptedAccount.Spec.InitialUsers) > 0 {
 		logger.Info("Reconciling initial users for adopted account",
 			"accountId", adoptedAccount.Spec.AWS.AccountID,
 			"userCount", len(adoptedAccount.Spec.InitialUsers))
-
-		// Get the target account to access its status
-		targetAccount := &organizationsv1alpha1.Account{}
-		targetKey := k8stypes.NamespacedName{
-			Name:      targetAccountName,
-			Namespace: targetNamespace,
-		}
-
-		if err := r.Get(ctx, targetKey, targetAccount); err != nil {
-			logger.Error(err, "failed to get target account for user reconciliation")
-			return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("Failed to get target account: %v", err))
-		}
-
-		// Ensure the Account has the AccountId populated
-		if targetAccount.Status.AccountId == "" {
-			logger.Error(nil, "target Account does not have AccountId populated yet",
-				"targetAccount", fmt.Sprintf("%s/%s", targetNamespace, targetAccountName))
-			return r.markAdoptionFailed(ctx, adoptedAccount, "Target Account does not have AccountId populated - this is a timing issue")
-		}
-
-		// Validate the AccountId matches what we expect
-		if targetAccount.Status.AccountId != adoptedAccount.Spec.AWS.AccountID {
-			logger.Error(nil, "target Account has different AccountId than expected",
-				"expected", adoptedAccount.Spec.AWS.AccountID,
-				"actual", targetAccount.Status.AccountId)
-			return r.markAdoptionFailed(ctx, adoptedAccount, fmt.Sprintf("AccountId mismatch: expected %s, got %s",
-				adoptedAccount.Spec.AWS.AccountID, targetAccount.Status.AccountId))
-		}
-
-		logger.Info("Target account validated, proceeding with user creation",
-			"accountId", targetAccount.Status.AccountId,
-			"targetAccount", fmt.Sprintf("%s/%s", targetNamespace, targetAccountName))
 
 		if err := r.reconcileInitialUsersForAdopted(ctx, adoptedAccount, targetAccount); err != nil {
 			logger.Error(err, "failed to reconcile initial users")
@@ -265,7 +281,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 	}
 
 	// Remove skip-reconcile annotation from the target Account to allow normal reconciliation
-	targetAccount := &organizationsv1alpha1.Account{}
+	targetAccount = &organizationsv1alpha1.Account{}
 	if err := r.Get(ctx, k8stypes.NamespacedName{
 		Name:      targetAccountName,
 		Namespace: targetNamespace,
@@ -481,6 +497,193 @@ func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adop
 		"observedGeneration", finalAccount.Status.ObservedGeneration)
 
 	return targetName, targetNamespace, nil
+}
+
+// createACKConfigMapsForAdoptedAccount creates ConfigMaps for an adopted account based on the target Account spec
+func (r *AdoptedAccountReconciler) createACKConfigMapsForAdoptedAccount(ctx context.Context, adoptedAccount *organizationsv1alpha1.AdoptedAccount, targetAccount *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	accountId := adoptedAccount.Spec.AWS.AccountID
+
+	for _, roleSpec := range targetAccount.Spec.ACKServicesIAMRoles {
+		if len(roleSpec.TargetNamespaces) == 0 {
+			logger.Info("No target namespaces specified for role, skipping ConfigMap creation",
+				"roleName", roleSpec.RoleName,
+				"accountId", accountId)
+			continue
+		}
+
+		roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", accountId, roleSpec.RoleName)
+
+		for _, namespace := range roleSpec.TargetNamespaces {
+			logger.Info("Creating/updating ack-role-account-map ConfigMap for adopted account",
+				"namespace", namespace,
+				"accountId", accountId,
+				"roleArn", roleArn,
+				"roleName", roleSpec.RoleName)
+
+			if err := r.createOrUpdateConfigMapInNamespaceForAdopted(ctx, namespace, accountId, roleArn); err != nil {
+				logger.Error(err, "failed to create/update ConfigMap for adopted account",
+					"namespace", namespace,
+					"accountId", accountId,
+					"roleArn", roleArn)
+				return fmt.Errorf("failed to create/update ConfigMap in namespace %s: %w", namespace, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// createOrUpdateConfigMapInNamespaceForAdopted creates or updates ConfigMap for adopted accounts
+func (r *AdoptedAccountReconciler) createOrUpdateConfigMapInNamespaceForAdopted(ctx context.Context, namespace, accountId, roleArn string) error {
+	logger := log.FromContext(ctx)
+
+	configMapName := "ack-role-account-map"
+	configMap := &corev1.ConfigMap{}
+	configMapKey := k8stypes.NamespacedName{
+		Name:      configMapName,
+		Namespace: namespace,
+	}
+
+	err := r.Get(ctx, configMapKey, configMap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Create new ConfigMap
+			logger.Info("Creating new ack-role-account-map ConfigMap for adopted account", "namespace", namespace)
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      configMapName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "aws-account-controller",
+						"app.kubernetes.io/component":  "ack-role-mapping",
+					},
+					Annotations: map[string]string{
+						"aws-account-controller/description": "Account-to-role mapping for ACK cross-account access",
+						"aws-account-controller/managed":     "true",
+						"aws-account-controller/source":      "adopted-account",
+					},
+				},
+				Data: map[string]string{
+					accountId: roleArn,
+				},
+			}
+
+			if err := r.Create(ctx, configMap); err != nil {
+				return fmt.Errorf("failed to create ConfigMap %s/%s: %w", namespace, configMapName, err)
+			}
+
+			logger.Info("Successfully created ack-role-account-map ConfigMap for adopted account",
+				"namespace", namespace,
+				"accountId", accountId,
+				"roleArn", roleArn)
+		} else {
+			return fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, configMapName, err)
+		}
+	} else {
+		// Update existing ConfigMap
+		logger.Info("Updating existing ack-role-account-map ConfigMap for adopted account", "namespace", namespace)
+
+		if configMap.Data == nil {
+			configMap.Data = make(map[string]string)
+		}
+
+		// Add or update the mapping for this account
+		configMap.Data[accountId] = roleArn
+
+		// Add management labels and annotations if not present
+		if configMap.Labels == nil {
+			configMap.Labels = make(map[string]string)
+		}
+		if configMap.Annotations == nil {
+			configMap.Annotations = make(map[string]string)
+		}
+
+		configMap.Labels["app.kubernetes.io/managed-by"] = "aws-account-controller"
+		configMap.Labels["app.kubernetes.io/component"] = "ack-role-mapping"
+		configMap.Annotations["aws-account-controller/description"] = "Account-to-role mapping for ACK cross-account access"
+		configMap.Annotations["aws-account-controller/managed"] = "true"
+
+		if err := r.Update(ctx, configMap); err != nil {
+			return fmt.Errorf("failed to update ConfigMap %s/%s: %w", namespace, configMapName, err)
+		}
+
+		logger.Info("Successfully updated ack-role-account-map ConfigMap for adopted account",
+			"namespace", namespace,
+			"accountId", accountId,
+			"roleArn", roleArn)
+	}
+
+	return nil
+}
+
+// cleanupACKConfigMapsForAdoptedAccount removes ConfigMap entries for an adopted account
+func (r *AdoptedAccountReconciler) cleanupACKConfigMapsForAdoptedAccount(ctx context.Context, adoptedAccount *organizationsv1alpha1.AdoptedAccount, targetAccount *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	accountId := adoptedAccount.Spec.AWS.AccountID
+
+	for _, roleSpec := range targetAccount.Spec.ACKServicesIAMRoles {
+		for _, namespace := range roleSpec.TargetNamespaces {
+			logger.Info("Cleaning up ack-role-account-map ConfigMap entry for adopted account",
+				"namespace", namespace,
+				"accountId", accountId,
+				"roleName", roleSpec.RoleName)
+
+			if err := r.removeAccountFromConfigMapForAdopted(ctx, namespace, accountId); err != nil {
+				logger.Error(err, "failed to cleanup ConfigMap entry for adopted account",
+					"namespace", namespace,
+					"accountId", accountId)
+			}
+		}
+	}
+
+	return nil
+}
+
+// removeAccountFromConfigMapForAdopted removes an account mapping from ConfigMap for adopted accounts
+func (r *AdoptedAccountReconciler) removeAccountFromConfigMapForAdopted(ctx context.Context, namespace, accountId string) error {
+	logger := log.FromContext(ctx)
+
+	configMapName := "ack-role-account-map"
+	configMap := &corev1.ConfigMap{}
+	configMapKey := k8stypes.NamespacedName{
+		Name:      configMapName,
+		Namespace: namespace,
+	}
+
+	err := r.Get(ctx, configMapKey, configMap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// ConfigMap doesn't exist, nothing to clean up
+			logger.Info("ConfigMap not found, nothing to clean up", "namespace", namespace, "configMap", configMapName)
+			return nil
+		}
+		return fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, configMapName, err)
+	}
+
+	// Remove the account mapping if it exists
+	if configMap.Data != nil {
+		if _, exists := configMap.Data[accountId]; exists {
+			delete(configMap.Data, accountId)
+
+			if err := r.Update(ctx, configMap); err != nil {
+				return fmt.Errorf("failed to update ConfigMap %s/%s: %w", namespace, configMapName, err)
+			}
+
+			logger.Info("Removed account mapping from ConfigMap for adopted account",
+				"namespace", namespace,
+				"accountId", accountId,
+				"configMap", configMapName)
+		} else {
+			logger.Info("Account mapping not found in ConfigMap, nothing to remove",
+				"namespace", namespace,
+				"accountId", accountId)
+		}
+	}
+
+	return nil
 }
 
 // reconcileInitialUsersForAdopted handles initial user creation for adopted accounts
@@ -946,6 +1149,24 @@ func (r *AdoptedAccountReconciler) handleAdoptedAccountDeletion(ctx context.Cont
 	}
 
 	logger.Info("Handling AdoptedAccount deletion", "name", adoptedAccount.Name)
+
+	// Get the target account if it exists to clean up ConfigMaps
+	if adoptedAccount.Status.TargetAccountName != "" && adoptedAccount.Status.TargetAccountNamespace != "" {
+		targetAccount := &organizationsv1alpha1.Account{}
+		targetKey := k8stypes.NamespacedName{
+			Name:      adoptedAccount.Status.TargetAccountName,
+			Namespace: adoptedAccount.Status.TargetAccountNamespace,
+		}
+
+		if err := r.Get(ctx, targetKey, targetAccount); err == nil {
+			logger.Info("Cleaning up ConfigMaps during AdoptedAccount deletion")
+			if err := r.cleanupACKConfigMapsForAdoptedAccount(ctx, adoptedAccount, targetAccount); err != nil {
+				logger.Error(err, "failed to cleanup ConfigMaps during deletion")
+			}
+		} else {
+			logger.Info("Target account not found, skipping ConfigMap cleanup", "error", err)
+		}
+	}
 
 	// Clean up initial users if they exist
 	if len(adoptedAccount.Status.InitialUsers) > 0 && adoptedAccount.Status.TargetAccountName != "" {

@@ -30,6 +30,11 @@ type ACKServiceIAMRole struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	Services []ACKService `json:"services"`
+
+	// TargetNamespaces specifies the Kubernetes namespaces where ack-role-account-map ConfigMaps should be created/updated
+	// These are typically the namespaces where ACK controllers are running
+	// +optional
+	TargetNamespaces []string `json:"targetNamespaces,omitempty"`
 }
 
 // AccountSpec defines the desired state of Account
@@ -84,6 +89,14 @@ type CrossAccountRoleStatus struct {
 	// FailureReason provides the reason for failure if state is FAILED
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
+
+	// TargetNamespaces is the list of namespaces where ConfigMaps were created/updated
+	// +optional
+	TargetNamespaces []string `json:"targetNamespaces,omitempty"`
+
+	// ConfigMapUpdateStatus tracks the status of ConfigMap updates per namespace
+	// +optional
+	ConfigMapUpdateStatus map[string]string `json:"configMapUpdateStatus,omitempty"`
 }
 
 // AccountStatus defines the observed state of Account

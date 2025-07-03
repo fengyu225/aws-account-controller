@@ -110,6 +110,13 @@ spec:
                         type: object
                       minItems: 1
                       type: array
+                    targetNamespaces:
+                      description: |-
+                        TargetNamespaces specifies the Kubernetes namespaces where ack-role-account-map ConfigMaps should be created/updated
+                        These are typically the namespaces where ACK controllers are running
+                      items:
+                        type: string
+                      type: array
                   required:
                   - roleName
                   - services
@@ -263,6 +270,12 @@ spec:
                   description: CrossAccountRoleStatus represents the status of a cross-account
                     role
                   properties:
+                    configMapUpdateStatus:
+                      additionalProperties:
+                        type: string
+                      description: ConfigMapUpdateStatus tracks the status of ConfigMap
+                        updates per namespace
+                      type: object
                     failureReason:
                       description: FailureReason provides the reason for failure if
                         state is FAILED
@@ -288,6 +301,12 @@ spec:
                       - FAILED
                       - UPDATING
                       type: string
+                    targetNamespaces:
+                      description: TargetNamespaces is the list of namespaces where
+                        ConfigMaps were created/updated
+                      items:
+                        type: string
+                      type: array
                   required:
                   - roleName
                   - services

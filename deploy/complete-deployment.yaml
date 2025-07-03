@@ -52,8 +52,14 @@ spec:
           env:
             - name: ORG_MGMT_ACCOUNT_ID
               value: "072422391281"
+            - name: ACCOUNT_DELETION_MODE
+              value: "soft"
+            - name: DELETED_ACCOUNTS_OU_ID
+              value: "ou-example-deleted123"
             - name: AWS_ACCOUNT_ID
               value: "164314285563"
+            - name: DEFAULT_ORGANIZATIONAL_UNIT_ID
+              value: "ou-example-default123"
           resources:
             requests:
               cpu: 100m

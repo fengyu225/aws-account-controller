@@ -49,6 +49,16 @@ const (
 
 	// Annotations
 	ownerAccountIDAnnotation = "services.k8s.aws/owner-account-id"
+	deletionModeAnnotation   = "organizations.aws.fcp.io/deletion-mode"
+
+	// Deletion Modes
+	deletionModeSoft = "soft"
+	deletionModeHard = "hard"
+
+	// Soft Delete Tags
+	deletedAccountTag      = "aws-account-controller:deleted"
+	deletedTimestampTag    = "aws-account-controller:deleted-timestamp"
+	deletedOriginalNameTag = "aws-account-controller:original-name"
 )
 
 // AccountReconciler reconciles an Account object
@@ -69,6 +79,7 @@ func isAdoptedAccount(account *organizationsv1alpha1.Account) bool {
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // AWS Permissions needed: organizations:CreateAccount,organizations:DescribeCreateAccountStatus,organizations:ListParents,organizations:MoveAccount,organizations:TagResource,organizations:CloseAccount
 
 // Reconcile is part of the main kubernetes reconciliation loop
@@ -215,7 +226,7 @@ func (r *AccountReconciler) handleExistingAccount(ctx context.Context, account *
 	return ctrl.Result{RequeueAfter: fullReconcileInterval}, nil
 }
 
-// handleAccountDeletion handles the deletion of an AWS account
+// handleAccountDeletion handles the deletion of an AWS account (soft or hard based on configuration)
 func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *organizationsv1alpha1.Account) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -223,7 +234,10 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("Handling account deletion", "accountId", account.Status.AccountId)
+	deletionMode := r.getDeletionMode(account)
+	logger.Info("Handling account deletion",
+		"accountId", account.Status.AccountId,
+		"deletionMode", deletionMode)
 
 	// Remove owner-account-id annotation from namespace
 	if err := r.removeNamespaceAnnotation(ctx, account); err != nil {
@@ -231,6 +245,11 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 	}
 
 	if account.Status.AccountId != "" {
+		// Clean up ConfigMaps first (before cleaning up IAM roles)
+		if err := r.cleanupAllACKRoleAccountMaps(ctx, account); err != nil {
+			logger.Error(err, "failed to cleanup ACK role account maps")
+		}
+
 		// Clean up initial users
 		if len(account.Status.InitialUsers) > 0 {
 			if err := r.cleanupAllInitialUsers(ctx, account); err != nil {
@@ -242,14 +261,24 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 		if err := r.cleanupAllCrossAccountRoles(ctx, account); err != nil {
 			logger.Error(err, "failed to cleanup cross-account roles")
 		}
-	}
 
-	if account.Status.AccountId != "" {
-		if err := r.deleteAWSAccount(ctx, account.Status.AccountId); err != nil {
-			logger.Error(err, "failed to delete AWS account", "accountId", account.Status.AccountId)
-			return ctrl.Result{RequeueAfter: time.Minute}, err
+		switch deletionMode {
+		case deletionModeSoft:
+			if err := r.softDeleteAWSAccount(ctx, account); err != nil {
+				logger.Error(err, "failed to soft delete AWS account", "accountId", account.Status.AccountId)
+				return ctrl.Result{RequeueAfter: time.Minute}, err
+			}
+			logger.Info("Successfully soft deleted AWS account", "accountId", account.Status.AccountId)
+		case deletionModeHard:
+			if err := r.hardDeleteAWSAccount(ctx, account); err != nil {
+				logger.Error(err, "failed to hard delete AWS account", "accountId", account.Status.AccountId)
+				return ctrl.Result{RequeueAfter: time.Minute}, err
+			}
+			logger.Info("Successfully hard deleted AWS account", "accountId", account.Status.AccountId)
+		default:
+			logger.Error(nil, "invalid deletion mode", "deletionMode", deletionMode)
+			return ctrl.Result{RequeueAfter: time.Minute}, fmt.Errorf("invalid deletion mode: %s", deletionMode)
 		}
-		logger.Info("Successfully deleted AWS account", "accountId", account.Status.AccountId)
 	}
 
 	controllerutil.RemoveFinalizer(account, accountFinalizer)
@@ -259,6 +288,138 @@ func (r *AccountReconciler) handleAccountDeletion(ctx context.Context, account *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// getDeletionMode determines whether to use soft delete or hard delete
+// Priority: 1. Account annotation, 2. Environment variable, 3. Default (soft)
+func (r *AccountReconciler) getDeletionMode(account *organizationsv1alpha1.Account) string {
+	// Check account-specific annotation first
+	if account.Annotations != nil {
+		if mode, exists := account.Annotations[deletionModeAnnotation]; exists {
+			if mode == deletionModeSoft || mode == deletionModeHard {
+				return mode
+			}
+		}
+	}
+
+	// Check global environment variable
+	globalMode := getEnvOrDefault("ACCOUNT_DELETION_MODE", deletionModeSoft)
+	if globalMode == deletionModeHard {
+		return deletionModeHard
+	}
+
+	// Default to soft delete for safety
+	return deletionModeSoft
+}
+
+// hardDeleteAWSAccount permanently closes an AWS account using Organizations API
+func (r *AccountReconciler) hardDeleteAWSAccount(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	orgClient, err := r.getOrganizationsClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get organizations client: %w", err)
+	}
+
+	accountId := account.Status.AccountId
+
+	logger.Info("Attempting to permanently close AWS account", "accountId", accountId)
+	logger.Info("HARD DELETE: This operation is irreversible and will permanently close the account", "accountId", accountId)
+
+	closeAccountInput := &organizations.CloseAccountInput{
+		AccountId: aws.String(accountId),
+	}
+
+	_, err = orgClient.CloseAccount(ctx, closeAccountInput)
+	if err != nil {
+		return fmt.Errorf("failed to close AWS account %s: %w", accountId, err)
+	}
+
+	logger.Info("AWS account closure initiated successfully (HARD DELETE)", "accountId", accountId)
+	return nil
+}
+
+// softDeleteAWSAccount moves an account to the deleted accounts OU and tags it as deleted
+func (r *AccountReconciler) softDeleteAWSAccount(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	orgClient, err := r.getOrganizationsClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get organizations client: %w", err)
+	}
+
+	accountId := account.Status.AccountId
+	deletedAccountsOU := getEnvOrDefault("DELETED_ACCOUNTS_OU_ID", "")
+
+	if deletedAccountsOU == "" {
+		return fmt.Errorf("DELETED_ACCOUNTS_OU_ID not configured, skipping account move. Account will be left in current OU. accountId: %s", accountId)
+	} else {
+		logger.Info("Moving account to deleted accounts OU",
+			"accountId", accountId,
+			"deletedAccountsOU", deletedAccountsOU)
+
+		if err := r.moveAccountToOU(ctx, orgClient, accountId, deletedAccountsOU); err != nil {
+			return fmt.Errorf("failed to move account to deleted accounts OU: %w", err)
+		}
+
+		logger.Info("Successfully moved account to deleted accounts OU",
+			"accountId", accountId,
+			"deletedAccountsOU", deletedAccountsOU)
+	}
+
+	if err := r.tagAccountAsDeleted(ctx, orgClient, account); err != nil {
+		logger.Error(err, "failed to tag account as deleted", "accountId", accountId)
+	}
+
+	return nil
+}
+
+// tagAccountAsDeleted adds deletion tags to mark the account as soft deleted
+func (r *AccountReconciler) tagAccountAsDeleted(ctx context.Context, orgClient *organizations.Client, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	deletionTime := time.Now().UTC().Format(time.RFC3339)
+
+	deletionTags := []types.Tag{
+		{
+			Key:   aws.String(deletedAccountTag),
+			Value: aws.String("true"),
+		},
+		{
+			Key:   aws.String(deletedTimestampTag),
+			Value: aws.String(deletionTime),
+		},
+		{
+			Key:   aws.String(deletedOriginalNameTag),
+			Value: aws.String(account.Spec.AccountName),
+		},
+	}
+
+	// Add kubernetes resource info
+	deletionTags = append(deletionTags, types.Tag{
+		Key:   aws.String("aws-account-controller:deleted-k8s-name"),
+		Value: aws.String(account.Name),
+	})
+	deletionTags = append(deletionTags, types.Tag{
+		Key:   aws.String("aws-account-controller:deleted-k8s-namespace"),
+		Value: aws.String(account.Namespace),
+	})
+
+	_, err := orgClient.TagResource(ctx, &organizations.TagResourceInput{
+		ResourceId: aws.String(account.Status.AccountId),
+		Tags:       deletionTags,
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to tag account as deleted: %w", err)
+	}
+
+	logger.Info("Successfully tagged account as deleted",
+		"accountId", account.Status.AccountId,
+		"deletionTime", deletionTime,
+		"originalName", account.Spec.AccountName)
+
+	return nil
 }
 
 // updateNamespaceAnnotation adds the owner-account-id annotation to the namespace
@@ -408,30 +569,6 @@ func (r *AccountReconciler) cleanupSingleRole(ctx context.Context, iamClient *ia
 	}
 
 	logger.Info("Successfully cleaned up cross-account role", "roleName", roleName)
-	return nil
-}
-
-// deleteAWSAccount closes/deletes an AWS account using Organizations API
-func (r *AccountReconciler) deleteAWSAccount(ctx context.Context, accountId string) error {
-	logger := log.FromContext(ctx)
-
-	orgClient, err := r.getOrganizationsClient(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get organizations client: %w", err)
-	}
-
-	logger.Info("Attempting to close AWS account", "accountId", accountId)
-
-	closeAccountInput := &organizations.CloseAccountInput{
-		AccountId: aws.String(accountId),
-	}
-
-	_, err = orgClient.CloseAccount(ctx, closeAccountInput)
-	if err != nil {
-		return fmt.Errorf("failed to close AWS account %s: %w", accountId, err)
-	}
-
-	logger.Info("AWS account closure initiated successfully", "accountId", accountId)
 	return nil
 }
 
@@ -973,7 +1110,13 @@ func (r *AccountReconciler) handleMultipleCrossAccountRoles(ctx context.Context,
 				roleStatus.State = "FAILED"
 				roleStatus.FailureReason = err.Error()
 			} else {
-				roleStatus.State = "READY"
+				if err := r.createOrUpdateACKRoleAccountMaps(ctx, account, roleSpec, &roleStatus); err != nil {
+					logger.Error(err, "failed to create/update ConfigMaps", "roleName", roleSpec.RoleName)
+					roleStatus.State = "FAILED"
+					roleStatus.FailureReason = fmt.Sprintf("Role created but ConfigMap update failed: %v", err)
+				} else {
+					roleStatus.State = "READY"
+				}
 			}
 		}
 
@@ -984,6 +1127,11 @@ func (r *AccountReconciler) handleMultipleCrossAccountRoles(ctx context.Context,
 	for _, existingRole := range account.Status.CrossAccountRoles {
 		if !managedRoles[existingRole.RoleName] {
 			logger.Info("Removing role no longer in spec", "roleName", existingRole.RoleName)
+
+			if err := r.cleanupACKRoleAccountMaps(ctx, account, existingRole); err != nil {
+				logger.Error(err, "failed to cleanup ConfigMaps for removed role", "roleName", existingRole.RoleName)
+			}
+
 			if err := r.cleanupSingleRole(ctx, iamClient, existingRole.RoleName); err != nil {
 				logger.Error(err, "failed to cleanup removed role", "roleName", existingRole.RoleName)
 			}
@@ -991,7 +1139,24 @@ func (r *AccountReconciler) handleMultipleCrossAccountRoles(ctx context.Context,
 	}
 
 	account.Status.CrossAccountRoles = newRoleStatuses
-	r.updateCondition(account, "CrossAccountRolesCreated", metav1.ConditionTrue, "RolesReconciled", fmt.Sprintf("Successfully reconciled %d cross-account roles", len(newRoleStatuses)))
+
+	successfulConfigMaps := 0
+	totalConfigMaps := 0
+	for _, roleStatus := range newRoleStatuses {
+		for _, status := range roleStatus.ConfigMapUpdateStatus {
+			totalConfigMaps++
+			if status == "Success" {
+				successfulConfigMaps++
+			}
+		}
+	}
+
+	conditionMessage := fmt.Sprintf("Successfully reconciled %d cross-account roles", len(newRoleStatuses))
+	if totalConfigMaps > 0 {
+		conditionMessage += fmt.Sprintf(" and %d/%d ConfigMaps", successfulConfigMaps, totalConfigMaps)
+	}
+
+	r.updateCondition(account, "CrossAccountRolesCreated", metav1.ConditionTrue, "RolesReconciled", conditionMessage)
 
 	return ctrl.Result{}, nil
 }
@@ -1172,6 +1337,214 @@ func (r *AccountReconciler) reconcileServicePoliciesForRole(ctx context.Context,
 		_, err := iamClient.PutRolePolicy(ctx, putInput)
 		if err != nil {
 			return fmt.Errorf("failed to put inline policy %s: %w", policyName, err)
+		}
+	}
+
+	return nil
+}
+
+// createOrUpdateACKRoleAccountMaps creates or updates ack-role-account-map ConfigMaps in target namespaces
+func (r *AccountReconciler) createOrUpdateACKRoleAccountMaps(ctx context.Context, account *organizationsv1alpha1.Account, roleSpec organizationsv1alpha1.ACKServiceIAMRole, roleStatus *organizationsv1alpha1.CrossAccountRoleStatus) error {
+	logger := log.FromContext(ctx)
+
+	if len(roleSpec.TargetNamespaces) == 0 {
+		logger.Info("No target namespaces specified for role, skipping ConfigMap creation", "roleName", roleSpec.RoleName)
+		return nil
+	}
+
+	roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", account.Status.AccountId, roleSpec.RoleName)
+
+	if roleStatus.ConfigMapUpdateStatus == nil {
+		roleStatus.ConfigMapUpdateStatus = make(map[string]string)
+	}
+	roleStatus.TargetNamespaces = roleSpec.TargetNamespaces
+
+	for _, namespace := range roleSpec.TargetNamespaces {
+		logger.Info("Creating/updating ack-role-account-map ConfigMap",
+			"namespace", namespace,
+			"accountId", account.Status.AccountId,
+			"roleArn", roleArn,
+			"roleName", roleSpec.RoleName)
+
+		if err := r.createOrUpdateConfigMapInNamespace(ctx, namespace, account.Status.AccountId, roleArn); err != nil {
+			logger.Error(err, "failed to create/update ConfigMap",
+				"namespace", namespace,
+				"accountId", account.Status.AccountId,
+				"roleArn", roleArn)
+			roleStatus.ConfigMapUpdateStatus[namespace] = fmt.Sprintf("Failed: %v", err)
+		} else {
+			roleStatus.ConfigMapUpdateStatus[namespace] = "Success"
+			logger.Info("Successfully created/updated ack-role-account-map ConfigMap",
+				"namespace", namespace,
+				"accountId", account.Status.AccountId,
+				"roleArn", roleArn)
+		}
+	}
+
+	return nil
+}
+
+// createOrUpdateConfigMapInNamespace creates or updates the ack-role-account-map ConfigMap in a specific namespace
+func (r *AccountReconciler) createOrUpdateConfigMapInNamespace(ctx context.Context, namespace, accountId, roleArn string) error {
+	logger := log.FromContext(ctx)
+
+	configMapName := "ack-role-account-map"
+	configMap := &corev1.ConfigMap{}
+	configMapKey := k8stypes.NamespacedName{
+		Name:      configMapName,
+		Namespace: namespace,
+	}
+
+	err := r.Get(ctx, configMapKey, configMap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating new ack-role-account-map ConfigMap", "namespace", namespace)
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      configMapName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "aws-account-controller",
+						"app.kubernetes.io/component":  "ack-role-mapping",
+					},
+					Annotations: map[string]string{
+						"aws-account-controller/description": "Account-to-role mapping for ACK cross-account access",
+						"aws-account-controller/managed":     "true",
+					},
+				},
+				Data: map[string]string{
+					accountId: roleArn,
+				},
+			}
+
+			if err := r.Create(ctx, configMap); err != nil {
+				return fmt.Errorf("failed to create ConfigMap %s/%s: %w", namespace, configMapName, err)
+			}
+
+			logger.Info("Successfully created ack-role-account-map ConfigMap",
+				"namespace", namespace,
+				"accountId", accountId,
+				"roleArn", roleArn)
+		} else {
+			return fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, configMapName, err)
+		}
+	} else {
+		logger.Info("Updating existing ack-role-account-map ConfigMap", "namespace", namespace)
+
+		if configMap.Data == nil {
+			configMap.Data = make(map[string]string)
+		}
+
+		configMap.Data[accountId] = roleArn
+
+		if configMap.Labels == nil {
+			configMap.Labels = make(map[string]string)
+		}
+		if configMap.Annotations == nil {
+			configMap.Annotations = make(map[string]string)
+		}
+
+		configMap.Labels["app.kubernetes.io/managed-by"] = "aws-account-controller"
+		configMap.Labels["app.kubernetes.io/component"] = "ack-role-mapping"
+		configMap.Annotations["aws-account-controller/description"] = "Account-to-role mapping for ACK cross-account access"
+		configMap.Annotations["aws-account-controller/managed"] = "true"
+
+		if err := r.Update(ctx, configMap); err != nil {
+			return fmt.Errorf("failed to update ConfigMap %s/%s: %w", namespace, configMapName, err)
+		}
+
+		logger.Info("Successfully updated ack-role-account-map ConfigMap",
+			"namespace", namespace,
+			"accountId", accountId,
+			"roleArn", roleArn)
+	}
+
+	return nil
+}
+
+// cleanupACKRoleAccountMaps removes account mappings from ConfigMaps when roles are deleted
+func (r *AccountReconciler) cleanupACKRoleAccountMaps(ctx context.Context, account *organizationsv1alpha1.Account, roleStatus organizationsv1alpha1.CrossAccountRoleStatus) error {
+	logger := log.FromContext(ctx)
+
+	if len(roleStatus.TargetNamespaces) == 0 {
+		logger.Info("No target namespaces for role, skipping ConfigMap cleanup", "roleName", roleStatus.RoleName)
+		return nil
+	}
+
+	for _, namespace := range roleStatus.TargetNamespaces {
+		logger.Info("Cleaning up ack-role-account-map ConfigMap entry",
+			"namespace", namespace,
+			"accountId", account.Status.AccountId,
+			"roleName", roleStatus.RoleName)
+
+		if err := r.removeAccountFromConfigMap(ctx, namespace, account.Status.AccountId); err != nil {
+			logger.Error(err, "failed to cleanup ConfigMap entry",
+				"namespace", namespace,
+				"accountId", account.Status.AccountId)
+		} else {
+			logger.Info("Successfully cleaned up ConfigMap entry",
+				"namespace", namespace,
+				"accountId", account.Status.AccountId)
+		}
+	}
+
+	return nil
+}
+
+// removeAccountFromConfigMap removes an account mapping from the ConfigMap in a specific namespace
+func (r *AccountReconciler) removeAccountFromConfigMap(ctx context.Context, namespace, accountId string) error {
+	logger := log.FromContext(ctx)
+
+	configMapName := "ack-role-account-map"
+	configMap := &corev1.ConfigMap{}
+	configMapKey := k8stypes.NamespacedName{
+		Name:      configMapName,
+		Namespace: namespace,
+	}
+
+	err := r.Get(ctx, configMapKey, configMap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("ConfigMap not found, nothing to clean up", "namespace", namespace, "configMap", configMapName)
+			return nil
+		}
+		return fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, configMapName, err)
+	}
+
+	if configMap.Data != nil {
+		if _, exists := configMap.Data[accountId]; exists {
+			delete(configMap.Data, accountId)
+
+			if err := r.Update(ctx, configMap); err != nil {
+				return fmt.Errorf("failed to update ConfigMap %s/%s: %w", namespace, configMapName, err)
+			}
+
+			logger.Info("Removed account mapping from ConfigMap",
+				"namespace", namespace,
+				"accountId", accountId,
+				"configMap", configMapName)
+		} else {
+			logger.Info("Account mapping not found in ConfigMap, nothing to remove",
+				"namespace", namespace,
+				"accountId", accountId)
+		}
+	}
+
+	return nil
+}
+
+// cleanupAllACKRoleAccountMaps removes all account mappings for this account across all namespaces
+func (r *AccountReconciler) cleanupAllACKRoleAccountMaps(ctx context.Context, account *organizationsv1alpha1.Account) error {
+	logger := log.FromContext(ctx)
+
+	if account.Status.AccountId == "" {
+		logger.Info("No account ID available, skipping ConfigMap cleanup")
+		return nil
+	}
+
+	for _, roleStatus := range account.Status.CrossAccountRoles {
+		if err := r.cleanupACKRoleAccountMaps(ctx, account, roleStatus); err != nil {
+			logger.Error(err, "failed to cleanup ConfigMaps for role", "roleName", roleStatus.RoleName)
 		}
 	}
 
