@@ -15,7 +15,7 @@ metadata:
   namespace: network
 spec:
   aws:
-    accountID: "242343576447"
+    accountID: "051859107368"
   kubernetes:
     group: organizations.aws.fcp.io
     kind: Account
