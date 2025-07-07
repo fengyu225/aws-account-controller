@@ -1,4 +1,4 @@
-package controllers
+package reconciler
 
 // ACKServicePolicies contains the recommended managed and inline policies for each ACK service
 type ACKServicePolicies struct {

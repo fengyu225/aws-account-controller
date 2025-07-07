@@ -42,7 +42,7 @@ spec:
       serviceAccountName: aws-account-controller
       containers:
         - name: manager
-          image: 164314285563.dkr.ecr.us-west-2.amazonaws.com/aws-account-controller:v1.0.0
+          image: 164314285563.dkr.ecr.us-west-2.amazonaws.com/aws-account-controller:v1.0.1
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -55,11 +55,11 @@ spec:
             - name: ACCOUNT_DELETION_MODE
               value: "soft"
             - name: DELETED_ACCOUNTS_OU_ID
-              value: "ou-example-deleted123"
+              value: "ou-2355-z0r6hfiv"
             - name: AWS_ACCOUNT_ID
               value: "164314285563"
             - name: DEFAULT_ORGANIZATIONAL_UNIT_ID
-              value: "ou-example-default123"
+              value: "ou-2355-o1w7mgi3"
           resources:
             requests:
               cpu: 100m

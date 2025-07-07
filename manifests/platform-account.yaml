@@ -10,7 +10,7 @@ metadata:
   namespace: platform
 spec:
   accountName: "FCP Test Account - Platform 1"
-  email: "d5605732-e816-4ee9-ae48-52308a7d4b23@example.com"
+  email: "d5605732-e816-4ee9-ae48-52309a7d4b23@example.com"
   iamUserAccessToBilling: "DENY"
   ackServicesIAMRoles:
     - roleName: "ACK-CrossAccount-Storage"

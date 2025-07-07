@@ -3,25 +3,24 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"time"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
-	"github.com/aws/aws-sdk-go-v2/service/organizations/types"
+	orgtypes "github.com/aws/aws-sdk-go-v2/service/organizations/types"
+	organizationsv1alpha1 "github.com/fcp/aws-account-controller/api/v1alpha1"
+	"github.com/fcp/aws-account-controller/controllers/services"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	organizationsv1alpha1 "github.com/fcp/aws-account-controller/api/v1alpha1"
+	"time"
 )
 
 const (
@@ -35,12 +34,13 @@ type AdoptedAccountReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=adoptedaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=adoptedaccounts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=adoptedaccounts/finalizers,verbs=update
+// +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=adoptedaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=organizations.aws.fcp.io,resources=accounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *AdoptedAccountReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -143,7 +143,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 		// Only update to IN_PROGRESS if we're not already there
 		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			latest := &organizationsv1alpha1.AdoptedAccount{}
-			if err := r.Get(ctx, k8stypes.NamespacedName{
+			if err := r.Get(ctx, types.NamespacedName{
 				Name:      adoptedAccount.Name,
 				Namespace: adoptedAccount.Namespace,
 			}, latest); err != nil {
@@ -195,7 +195,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 
 	// Get the target account to access its status and spec
 	targetAccount := &organizationsv1alpha1.Account{}
-	targetKey := k8stypes.NamespacedName{
+	targetKey := types.NamespacedName{
 		Name:      targetAccountName,
 		Namespace: targetNamespace,
 	}
@@ -258,7 +258,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 	// Use retry logic for the final status update
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &organizationsv1alpha1.AdoptedAccount{}
-		if err := r.Get(ctx, k8stypes.NamespacedName{
+		if err := r.Get(ctx, types.NamespacedName{
 			Name:      adoptedAccount.Name,
 			Namespace: adoptedAccount.Namespace,
 		}, latest); err != nil {
@@ -282,7 +282,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 
 	// Remove skip-reconcile annotation from the target Account to allow normal reconciliation
 	targetAccount = &organizationsv1alpha1.Account{}
-	if err := r.Get(ctx, k8stypes.NamespacedName{
+	if err := r.Get(ctx, types.NamespacedName{
 		Name:      targetAccountName,
 		Namespace: targetNamespace,
 	}, targetAccount); err != nil {
@@ -314,7 +314,7 @@ func (r *AdoptedAccountReconciler) handleAdoptionProcess(ctx context.Context, ad
 }
 
 // describeAWSAccount retrieves account details from AWS Organizations
-func (r *AdoptedAccountReconciler) describeAWSAccount(ctx context.Context, orgClient *organizations.Client, accountID string) (*types.Account, error) {
+func (r *AdoptedAccountReconciler) describeAWSAccount(ctx context.Context, orgClient *organizations.Client, accountID string) (*orgtypes.Account, error) {
 	input := &organizations.DescribeAccountInput{
 		AccountId: aws.String(accountID),
 	}
@@ -328,7 +328,7 @@ func (r *AdoptedAccountReconciler) describeAWSAccount(ctx context.Context, orgCl
 }
 
 // createTargetAccount creates the Account resource based on the AWS account details
-func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adoptedAccount *organizationsv1alpha1.AdoptedAccount, accountDetails *types.Account) (string, string, error) {
+func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adoptedAccount *organizationsv1alpha1.AdoptedAccount, accountDetails *orgtypes.Account) (string, string, error) {
 	logger := log.FromContext(ctx)
 
 	targetName := adoptedAccount.Name
@@ -344,7 +344,7 @@ func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adop
 	}
 
 	existingAccount := &organizationsv1alpha1.Account{}
-	err := r.Get(ctx, k8stypes.NamespacedName{Name: targetName, Namespace: targetNamespace}, existingAccount)
+	err := r.Get(ctx, types.NamespacedName{Name: targetName, Namespace: targetNamespace}, existingAccount)
 	if err == nil {
 		if existingAccount.Status.AccountId == *accountDetails.Id {
 			logger.Info("Target Account already exists and matches AWS account",
@@ -360,7 +360,7 @@ func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adop
 				// Update the status using retry logic to handle conflicts
 				retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 					latest := &organizationsv1alpha1.Account{}
-					if err := r.Get(ctx, k8stypes.NamespacedName{Name: targetName, Namespace: targetNamespace}, latest); err != nil {
+					if err := r.Get(ctx, types.NamespacedName{Name: targetName, Namespace: targetNamespace}, latest); err != nil {
 						return err
 					}
 
@@ -451,7 +451,7 @@ func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adop
 	// Use retry logic to update the status properly
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		createdAccount := &organizationsv1alpha1.Account{}
-		if err := r.Get(ctx, k8stypes.NamespacedName{Name: targetName, Namespace: targetNamespace}, createdAccount); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Name: targetName, Namespace: targetNamespace}, createdAccount); err != nil {
 			return fmt.Errorf("failed to get created Account resource: %w", err)
 		}
 
@@ -481,7 +481,7 @@ func (r *AdoptedAccountReconciler) createTargetAccount(ctx context.Context, adop
 
 	// Verify the status was actually set by re-reading the resource
 	finalAccount := &organizationsv1alpha1.Account{}
-	if err := r.Get(ctx, k8stypes.NamespacedName{Name: targetName, Namespace: targetNamespace}, finalAccount); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: targetName, Namespace: targetNamespace}, finalAccount); err != nil {
 		return "", "", fmt.Errorf("failed to verify Account resource: %w", err)
 	}
 
@@ -541,7 +541,7 @@ func (r *AdoptedAccountReconciler) createOrUpdateConfigMapInNamespaceForAdopted(
 
 	configMapName := "ack-role-account-map"
 	configMap := &corev1.ConfigMap{}
-	configMapKey := k8stypes.NamespacedName{
+	configMapKey := types.NamespacedName{
 		Name:      configMapName,
 		Namespace: namespace,
 	}
@@ -648,7 +648,7 @@ func (r *AdoptedAccountReconciler) removeAccountFromConfigMapForAdopted(ctx cont
 
 	configMapName := "ack-role-account-map"
 	configMap := &corev1.ConfigMap{}
-	configMapKey := k8stypes.NamespacedName{
+	configMapKey := types.NamespacedName{
 		Name:      configMapName,
 		Namespace: namespace,
 	}
@@ -854,7 +854,7 @@ func (r *AdoptedAccountReconciler) ensureUserAccessKeyForAdopted(ctx context.Con
 
 		// Check if secret exists
 		secret := &corev1.Secret{}
-		secretKey := k8stypes.NamespacedName{
+		secretKey := types.NamespacedName{
 			Name:      secretName,
 			Namespace: adoptedAccount.Namespace,
 		}
@@ -933,7 +933,7 @@ func (r *AdoptedAccountReconciler) ensureUserAccessKeyForAdopted(ctx context.Con
 		if errors.IsAlreadyExists(err) {
 			// Update existing secret
 			existingSecret := &corev1.Secret{}
-			if err := r.Get(ctx, k8stypes.NamespacedName{Name: secretName, Namespace: adoptedAccount.Namespace}, existingSecret); err != nil {
+			if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: adoptedAccount.Namespace}, existingSecret); err != nil {
 				return fmt.Errorf("failed to get existing secret: %w", err)
 			}
 
@@ -1108,7 +1108,7 @@ func (r *AdoptedAccountReconciler) cleanupSingleUserForAdopted(ctx context.Conte
 	// Delete the Kubernetes secret
 	if secretName != "" {
 		secret := &corev1.Secret{}
-		secretKey := k8stypes.NamespacedName{
+		secretKey := types.NamespacedName{
 			Name:      secretName,
 			Namespace: adoptedAccount.Namespace,
 		}
@@ -1153,7 +1153,7 @@ func (r *AdoptedAccountReconciler) handleAdoptedAccountDeletion(ctx context.Cont
 	// Get the target account if it exists to clean up ConfigMaps
 	if adoptedAccount.Status.TargetAccountName != "" && adoptedAccount.Status.TargetAccountNamespace != "" {
 		targetAccount := &organizationsv1alpha1.Account{}
-		targetKey := k8stypes.NamespacedName{
+		targetKey := types.NamespacedName{
 			Name:      adoptedAccount.Status.TargetAccountName,
 			Namespace: adoptedAccount.Status.TargetAccountNamespace,
 		}
@@ -1171,7 +1171,7 @@ func (r *AdoptedAccountReconciler) handleAdoptedAccountDeletion(ctx context.Cont
 	// Clean up initial users if they exist
 	if len(adoptedAccount.Status.InitialUsers) > 0 && adoptedAccount.Status.TargetAccountName != "" {
 		targetAccount := &organizationsv1alpha1.Account{}
-		targetKey := k8stypes.NamespacedName{
+		targetKey := types.NamespacedName{
 			Name:      adoptedAccount.Status.TargetAccountName,
 			Namespace: adoptedAccount.Status.TargetAccountNamespace,
 		}
@@ -1194,17 +1194,16 @@ func (r *AdoptedAccountReconciler) handleAdoptedAccountDeletion(ctx context.Cont
 	return ctrl.Result{}, nil
 }
 
-// getOrganizationsClient returns an Organizations client (reuse from AccountReconciler)
+// getOrganizationsClient returns an Organizations client using the AWS service
 func (r *AdoptedAccountReconciler) getOrganizationsClient(ctx context.Context) (*organizations.Client, error) {
-	accountReconciler := &AccountReconciler{Client: r.Client, Scheme: r.Scheme}
-	return accountReconciler.getOrganizationsClient(ctx)
+	awsService := services.NewAWSService()
+	return awsService.GetOrganizationsClient(ctx)
 }
 
 // getIAMClientForAdoptedAccount returns an IAM client for the adopted account
 func (r *AdoptedAccountReconciler) getIAMClientForAdoptedAccount(ctx context.Context, accountID string) (*iam.Client, error) {
-	// Reuse the same IAM client logic from AccountReconciler
-	accountReconciler := &AccountReconciler{Client: r.Client, Scheme: r.Scheme}
-	return accountReconciler.getIAMClientForAccount(ctx, accountID)
+	awsService := services.NewAWSService()
+	return awsService.GetIAMClientForAccount(ctx, accountID)
 }
 
 // updateCondition updates or adds a condition to the AdoptedAccount status

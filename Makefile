@@ -1,5 +1,5 @@
 IMAGE_NAME ?= aws-account-controller
-IMAGE_TAG ?= v1.0.0
+IMAGE_TAG ?= v1.0.1
 AWS_ACCOUNT_ID ?= 164314285563
 AWS_REGION ?= us-west-2
 
