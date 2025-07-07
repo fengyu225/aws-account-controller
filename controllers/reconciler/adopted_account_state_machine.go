@@ -101,8 +101,6 @@ func (sm *AdoptedAccountStateMachine) ProcessState(ctx context.Context, state Ad
 	}
 }
 
-// Helper methods
-
 func (sm *AdoptedAccountStateMachine) hasFinalizer(adoptedAccount *organizationsv1alpha1.AdoptedAccount) bool {
 	const adoptedAccountFinalizer = "organizations.aws.fcp.io/adopted-account-finalizer"
 	for _, finalizer := range adoptedAccount.Finalizers {
