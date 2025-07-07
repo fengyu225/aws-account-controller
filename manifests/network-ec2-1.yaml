@@ -1,0 +1,9 @@
+apiVersion: kro.run/v1alpha1
+kind: AWSNetworkEC2
+metadata:
+  name: network-ec2-1
+spec:
+  platformAccountEmail: "e5605732-e816-4ee9-ae48-52309a7d4b23@example.com"
+  networkAccountEmail: "1037f117-ac56-4f6b-bbba-42deafe68097@example.com"
+  imageId: "ami-05ee755be0cd7555c"
+  region: "us-west-2"

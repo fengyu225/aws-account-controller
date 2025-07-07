@@ -1,0 +1,228 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: aws-network-ec2
+  namespace: kro
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: AWSNetworkEC2
+    spec:
+      platformAccountEmail: string | required=true
+      networkAccountEmail: string | required=true
+      instanceType: string | default="t2.small"
+      imageId: string | default="ami-05ee755be0cd7555c"
+      region: string | default="us-west-2"
+    status:
+      networkAccountId: ${networkAccount.status.accountId}
+      platformAccountId: ${platformAccount.status.accountId}
+      vpcId: ${networkVpc.status.vpcID}
+      subnet1Id: ${networkSubnet1.status.subnetID}
+      subnet2Id: ${networkSubnet2.status.subnetID}
+      securityGroupId: ${platformSecurityGroup.status.id}
+      instanceId: ${platformInstance.status.instanceID}
+
+  resources:
+    - id: platformNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: platform
+
+    - id: networkNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: network
+
+    - id: platformAccount
+      readyWhen:
+        - ${platformAccount.status.accountId != ""}
+      template:
+        apiVersion: organizations.aws.fcp.io/v1alpha1
+        kind: Account
+        metadata:
+          name: test-platform-account
+          namespace: platform
+        spec:
+          accountName: "FCP Test Account - Platform 1"
+          email: ${schema.spec.platformAccountEmail}
+          iamUserAccessToBilling: "DENY"
+          ackServicesIAMRoles:
+            - roleName: "ACK-CrossAccount-Platform"
+              services:
+                - serviceName: ec2
+                - serviceName: iam
+              targetNamespaces:
+                - ack-system
+
+    - id: networkAccount
+      readyWhen:
+        - ${networkAccount.status.accountId != ""}
+      template:
+        apiVersion: organizations.aws.fcp.io/v1alpha1
+        kind: Account
+        metadata:
+          name: test-network-account
+          namespace: network
+        spec:
+          accountName: "FCP Test Account - Network 1"
+          email: ${schema.spec.networkAccountEmail}
+          iamUserAccessToBilling: "DENY"
+          ackServicesIAMRoles:
+            - roleName: "ACK-CrossAccount-Network"
+              services:
+                - serviceName: ec2
+                - serviceName: ram
+              targetNamespaces:
+                - ack-system
+
+    - id: networkVpc
+      readyWhen:
+        - ${networkVpc.status.vpcID != ""}
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: VPC
+        metadata:
+          name: test-network-vpc
+          namespace: network
+        spec:
+          cidrBlocks:
+            - "10.0.0.0/16"
+          enableDNSHostnames: true
+          enableDNSSupport: true
+          tags:
+            - key: Name
+              value: test-network-vpc
+            - key: Environment
+              value: network
+            - key: ManagedBy
+              value: ACK
+
+    - id: networkSubnet1
+      readyWhen:
+        - ${networkSubnet1.status.subnetID != ""}
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: Subnet
+        metadata:
+          name: test-network-private-subnet-1
+          namespace: network
+        spec:
+          availabilityZone: "${schema.spec.region}a"
+          cidrBlock: "10.0.10.0/24"
+          mapPublicIPOnLaunch: false
+          vpcID: ${networkVpc.status.vpcID}
+          tags:
+            - key: Name
+              value: test-network-private-subnet-1
+            - key: Type
+              value: private
+
+    - id: networkSubnet2
+      readyWhen:
+        - ${networkSubnet2.status.subnetID != ""}
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: Subnet
+        metadata:
+          name: test-network-private-subnet-2
+          namespace: network
+        spec:
+          availabilityZone: "${schema.spec.region}b"
+          cidrBlock: "10.0.11.0/24"
+          mapPublicIPOnLaunch: false
+          vpcID: ${networkVpc.status.vpcID}
+          tags:
+            - key: Name
+              value: test-network-private-subnet-2
+            - key: Type
+              value: private
+
+    - id: ramShare
+      template:
+        apiVersion: ram.services.k8s.aws/v1alpha1
+        kind: ResourceShare
+        metadata:
+          name: test-network-vpc-share
+          namespace: network
+        spec:
+          name: "test-network-vpc-resource-share"
+          resourceARNs:
+            - "arn:aws:ec2:${schema.spec.region}:${networkAccount.status.accountId}:subnet/${networkSubnet1.status.subnetID}"
+            - "arn:aws:ec2:${schema.spec.region}:${networkAccount.status.accountId}:subnet/${networkSubnet2.status.subnetID}"
+          principals:
+            - "${platformAccount.status.accountId}"
+          allowExternalPrincipals: false
+          tags:
+            - key: Purpose
+              value: vpc-sharing
+            - key: ManagedBy
+              value: ACK
+            - key: Environment
+              value: network
+
+    - id: platformSecurityGroup
+      readyWhen:
+        - ${platformSecurityGroup.status.id != ""}
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: SecurityGroup
+        metadata:
+          name: test-ec2-sg
+          namespace: platform
+        spec:
+          description: "Security group for EC2 instances"
+          name: platform-ec2-sg
+          vpcID: ${networkVpc.status.vpcID}
+          egressRules:
+            - ipProtocol: "-1"
+              ipRanges:
+                - cidrIP: "0.0.0.0/0"
+                  description: "Allow all outbound traffic"
+          tags:
+            - key: Name
+              value: platform-ec2-sg
+            - key: Environment
+              value: platform
+            - key: ManagedBy
+              value: ACK-EC2-Controller
+
+    - id: platformInstance
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: Instance
+        metadata:
+          name: test-ec2-instance
+          namespace: platform
+        spec:
+          imageID: "${schema.spec.imageId}"
+          instanceType: "${schema.spec.instanceType}"
+          subnetID: "${networkSubnet1.status.subnetID}"
+          securityGroupIDs:
+            - "${platformSecurityGroup.status.id}"
+          tags:
+            - key: Name
+              value: test-ec2-instance
+            - key: Environment
+              value: platform
+            - key: ManagedBy
+              value: ACK-EC2-Controller
+
+    - id: networkEC2Info
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: aws-network-ec2-info
+          namespace: kro
+        data:
+          networkAccountId: "${networkAccount.status.accountId}"
+          platformAccountId: "${platformAccount.status.accountId}"
+          vpcId: "${networkVpc.status.vpcID}"
+          subnet1Id: "${networkSubnet1.status.subnetID}"
+          subnet2Id: "${networkSubnet2.status.subnetID}"
+          securityGroupId: "${platformSecurityGroup.status.id}"
+          instanceId: "${platformInstance.status.instanceID}"
